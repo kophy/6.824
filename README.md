@@ -6,7 +6,7 @@ MIT 6.824: Distributed Systems Spring 2018
 
 ### Lab1 MapReduce
 - [X] MapReduce input and output
-- [ ] Single-worker word count
+- [X] Single-worker word count
 - [ ] Distributing MapReduce tasks
 - [ ] Handling worker failures
 - [ ] Inverted index generation
