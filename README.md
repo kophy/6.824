@@ -9,7 +9,7 @@ MIT 6.824: Distributed Systems Spring 2018
 - [X] Single-worker word count
 - [X] Distributing MapReduce tasks
 - [X] Handling worker failures
-- [ ] Inverted index generation
+- [X] Inverted index generation
 
 ### Lab 2 Raft
 - [ ] 2A
