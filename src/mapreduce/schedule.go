@@ -41,14 +41,15 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 
 		go func() {
 			defer wg.Done()
-			success := false
-			for !success {
+			// Rerun task until succeeds.
+			for {
 				srv := <-registerChan
-				success = call(srv, "Worker.DoTask", taskArgs, nil)
+				success := call(srv, "Worker.DoTask", taskArgs, nil)
 				if success {
 					go func() {
 						registerChan <- srv
 					}()
+					break
 				}
 			}
 		}()

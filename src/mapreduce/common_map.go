@@ -2,6 +2,7 @@ package mapreduce
 
 import (
 	"encoding/json"
+	"fmt"
 	"hash/fnv"
 	"log"
 	"os"
@@ -55,35 +56,40 @@ func doMap(
 	// Remember to close the file after you have written all the values!
 	//
 	// Your code here (Part I).
-	//
-	file, err := os.Open(inFile)
-	if err != nil {
-		log.Fatal(err)
-	}
-	info, err := file.Stat()
 
-	content := make([]byte, info.Size())
-	file.Read(content)
+	// Read contents from input file.
+	file, err := os.Open(inFile)
+	checkError(err, fmt.Sprintf("Failed to open input file %s.", inFile))
+	info, err := file.Stat()
+	checkError(err, "Failed to get input file info.")
+	contents := make([]byte, info.Size())
+	file.Read(contents)
 	file.Close()
 
-	mapResults := mapF(inFile, string(content))
+	// Call user-defined map function for input file's contents.
+	mappedResult := mapF(inFile, string(contents))
 
+	// Create intermediate files and corresponding json encoders.
 	encoders := make([]*json.Encoder, nReduce)
 	for i := range encoders {
-		file, err := os.Create(reduceName(jobName, mapTask, i))
-		if err != nil {
-			log.Fatal(err)
-		}
+		filename := reduceName(jobName, mapTask, i)
+		file, err := os.Create(filename)
+		checkError(err, "Failed to create intermediate file.")
 		defer file.Close()
 		encoders[i] = json.NewEncoder(file)
 	}
 
-	for _, kv := range mapResults {
+	// Partition output and write to corresponding intermediate file.
+	for _, kv := range mappedResult {
 		idx := ihash(kv.Key) % nReduce
 		err := encoders[idx].Encode(&kv)
-		if err != nil {
-			log.Fatal(err)
-		}
+		checkError(err, "Failed to encode key-value pair.")
+	}
+}
+
+func checkError(err error, message string) {
+	if err != nil {
+		log.Fatalf("%s, %s", err, message)
 	}
 }
 

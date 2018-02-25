@@ -2,7 +2,7 @@ package mapreduce
 
 import (
 	"encoding/json"
-	"log"
+	"fmt"
 	"os"
 )
 
@@ -49,39 +49,38 @@ func doReduce(
 	// file.Close()
 	//
 	// Your code here (Part I).
-	//
+
+	// Save key and all the values for that key.
 	kvMap := make(map[string][]string)
 
+	// Read corresponding one intermediate file of each map task.
 	for i := 0; i < nMap; i++ {
-		file, err := os.Open(reduceName(jobName, i, reduceTask))
-		if err != nil {
-			log.Fatal(err)
-		}
+		filename := reduceName(jobName, i, reduceTask)
+		file, err := os.Open(filename)
+		checkError(err, fmt.Sprintf("Failed to open intermediate file %s.", filename))
 		defer file.Close()
 
+		// Decode key-value pairs from intermediate file and insert into kvMap.
 		decoder := json.NewDecoder(file)
 		var kv KeyValue
 		for decoder.More() {
 			err := decoder.Decode(&kv)
-			if err != nil {
-				log.Fatal(err)
-			}
+			checkError(err, "Failed to decode key-value pair.")
 			kvMap[kv.Key] = append(kvMap[kv.Key], kv.Value)
 		}
 	}
 
+	// Create output file and corresponding json encoder.
 	file, err := os.Create(outFile)
-	if err != nil {
-		log.Fatal(err)
-	}
+	checkError(err, "Failed to create output file.")
 	defer file.Close()
 	encoder := json.NewEncoder(file)
 
+	// Call user-defined reduce function for each distinct key and write to output file.
 	for key, values := range kvMap {
-		v := reduceF(key, values)
-		err := encoder.Encode(&KeyValue{key, v})
-		if err != nil {
-			log.Fatal(err)
-		}
+		reducedValue := reduceF(key, values)
+		kv := KeyValue{key, reducedValue}
+		err := encoder.Encode(&kv)
+		checkError(err, "Failed to encode key-value pair.")
 	}
 }

@@ -15,7 +15,7 @@ import (
 // file's complete contents. You should ignore the input file name,
 // and look only at the contents argument. The return value is a slice
 // of key/value pairs.
-//
+
 func mapF(filename string, contents string) []mapreduce.KeyValue {
 	// Your code here (Part II).
 	words := strings.FieldsFunc(contents, func(r rune) bool {
