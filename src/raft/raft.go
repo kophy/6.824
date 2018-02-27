@@ -23,7 +23,19 @@ import "labrpc"
 // import "bytes"
 // import "labgob"
 
+type LogEntry struct {
+	Term    int
+	Command interface{}
+}
 
+//
+// Raft server states.
+//
+const (
+	STATE_CANDIDATE = iota
+	STATE_FOLLOWER
+	STATE_LEADER
+)
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -55,6 +67,24 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	state     int
+	voteCount int
+
+	// Persistent state on all servers.
+	currentTerm int
+	votedFor    int
+	log         []LogEntry
+
+	// Volatile state on all servers.
+	commitIndex int
+	lastApplied int
+
+	// Volatile state on leaders.
+	nextIndex  []int
+	matchIndex []int
+
+	// Channels between raft peers.
+
 }
 
 // return currentTerm and whether this server
@@ -64,9 +94,11 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	rf.mu.Lock()
+	term = rf.currentTerm
+	isleader = rf.state == STATE_LEADER
 	return term, isleader
 }
-
 
 //
 // save Raft's persistent state to stable storage,
@@ -83,7 +115,6 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
@@ -107,15 +138,16 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
-
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -124,6 +156,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int
+	VoteGranted bool
 }
 
 //
@@ -167,6 +201,19 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -187,7 +234,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
 
 	return index, term, isLeader
 }
@@ -221,10 +267,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.state = STATE_FOLLOWER
+	rf.voteCount = 0
+
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	rf.log = append(rf.log, LogEntry{Term: 0})
+
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
 
 	return rf
 }
