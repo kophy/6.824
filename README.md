@@ -12,7 +12,7 @@ MIT 6.824: Distributed Systems Spring 2018
 - [X] Inverted index generation
 
 ### Lab 2 Raft
-- [ ] 2A
+- [X] 2A
 - [ ] 2B
 - [ ] 2C
 
