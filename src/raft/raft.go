@@ -174,7 +174,7 @@ type RequestVoteReply struct {
 
 func (rf *Raft) isUpToDate(candidateTerm int, candidateIndex int) bool {
 	term, index := rf.getLastLogTerm(), rf.getLastLogIndex()
-	return candidateTerm >= term || (candidateTerm == term && candidateIndex >= index)
+	return candidateTerm > term || (candidateTerm == term && candidateIndex >= index)
 }
 
 //
@@ -279,6 +279,8 @@ func (rf *Raft) broadcastRequestVote() {
 	args.LastLogTerm = rf.getLastLogTerm()
 	rf.mu.Unlock()
 
+	// fmt.Printf("%d broadcast request vote\n", rf.me)
+
 	for server := range rf.peers {
 		if server != rf.me && rf.state == STATE_CANDIDATE {
 			go rf.sendRequestVote(server, args, &RequestVoteReply{})
@@ -363,7 +365,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 func (rf *Raft) hasConflictLog(leaderLog []LogEntry, localLog []LogEntry) bool {
 	for i := 0; i < len(leaderLog) && i < len(localLog); i++ {
 		if leaderLog[i].Term != localLog[i].Term {
-			fmt.Printf("conflict!\n")
 			return true
 		}
 	}
@@ -400,15 +401,17 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 		if rf.log[N].Term == rf.currentTerm {
 			for i := range rf.peers {
-				if rf.matchIndex[i] >= N {
+				if i != rf.me && rf.matchIndex[i] >= N {
 					count++
 				}
 			}
 		}
 
 		if count > len(rf.peers)/2 {
-			rf.commitIndex = N
-			go rf.commitLog()
+			if rf.commitIndex < N {
+				rf.commitIndex = N
+				go rf.commitLog()
+			}
 			break
 		}
 	}
@@ -429,6 +432,8 @@ func (rf *Raft) commitLog() {
 func (rf *Raft) broadcastAppendEntries() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	//fmt.Printf("%d broadcast heartbeat\n", rf.me)
 
 	for server := range rf.peers {
 		if server != rf.me && rf.state == STATE_LEADER {
@@ -501,10 +506,11 @@ func (rf *Raft) Run() {
 			case <-rf.chanHeartbeat:
 			case <-time.After(time.Millisecond * time.Duration(rand.Intn(200)+300)):
 				rf.state = STATE_CANDIDATE
+				fmt.Printf("%d become candidate\n", rf.me)
 			}
 		case STATE_LEADER:
 			rf.broadcastAppendEntries()
-			time.Sleep(time.Microsecond * 200)
+			time.Sleep(time.Microsecond * 240)
 		case STATE_CANDIDATE:
 			rf.mu.Lock()
 			rf.currentTerm++
