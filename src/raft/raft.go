@@ -21,7 +21,6 @@ import "sync"
 import "labrpc"
 import "math/rand"
 import "time"
-import "fmt"
 
 // import "bytes"
 // import "labgob"
@@ -279,8 +278,6 @@ func (rf *Raft) broadcastRequestVote() {
 	args.LastLogTerm = rf.getLastLogTerm()
 	rf.mu.Unlock()
 
-	// fmt.Printf("%d broadcast request vote\n", rf.me)
-
 	for server := range rf.peers {
 		if server != rf.me && rf.state == STATE_CANDIDATE {
 			go rf.sendRequestVote(server, args, &RequestVoteReply{})
@@ -333,7 +330,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	if args.PrevLogIndex >= 0 && args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
+	if args.PrevLogIndex > 0 && args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
 		term := rf.log[args.PrevLogIndex].Term
 		for reply.NextTryIndex = args.PrevLogIndex - 1; reply.NextTryIndex >= 0 && rf.log[reply.NextTryIndex].Term == term; reply.NextTryIndex-- {
 		}
@@ -433,8 +430,6 @@ func (rf *Raft) broadcastAppendEntries() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	//fmt.Printf("%d broadcast heartbeat\n", rf.me)
-
 	for server := range rf.peers {
 		if server != rf.me && rf.state == STATE_LEADER {
 			args := &AppendEntriesArgs{}
@@ -506,11 +501,10 @@ func (rf *Raft) Run() {
 			case <-rf.chanHeartbeat:
 			case <-time.After(time.Millisecond * time.Duration(rand.Intn(200)+300)):
 				rf.state = STATE_CANDIDATE
-				fmt.Printf("%d become candidate\n", rf.me)
 			}
 		case STATE_LEADER:
-			rf.broadcastAppendEntries()
-			time.Sleep(time.Microsecond * 240)
+			go rf.broadcastAppendEntries()
+			time.Sleep(time.Millisecond * 200)
 		case STATE_CANDIDATE:
 			rf.mu.Lock()
 			rf.currentTerm++
