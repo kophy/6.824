@@ -17,10 +17,12 @@ package raft
 //   in the same server.
 //
 
-import "sync"
-import "labrpc"
-import "math/rand"
-import "time"
+import (
+	"labrpc"
+	"math/rand"
+	"sync"
+	"time"
+)
 
 // import "bytes"
 // import "labgob"
@@ -248,18 +250,18 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 			// invalid request
 			return ok
 		}
-
 		if rf.currentTerm < reply.Term {
 			// revert to follower state and update current term
 			rf.state = STATE_FOLLOWER
 			rf.currentTerm = reply.Term
 			rf.votedFor = -1
+			return ok
 		}
 
 		if reply.VoteGranted {
 			rf.voteCount++
 			if rf.voteCount > len(rf.peers)/2 {
-				// win the election and become leader
+				// win the election
 				rf.state = STATE_LEADER
 				rf.chanWinElect <- true
 			}
@@ -330,16 +332,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	if args.PrevLogIndex > 0 && args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
+	if args.PrevLogIndex >= 0 && args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
+		// if entry log[prevLogIndex] conflicts with new one, there may be conflict entries before.
+		// we can bypass all entries during the problematic term to speed up.
 		term := rf.log[args.PrevLogIndex].Term
-		for reply.NextTryIndex = args.PrevLogIndex - 1; reply.NextTryIndex >= 0 && rf.log[reply.NextTryIndex].Term == term; reply.NextTryIndex-- {
+		for i := args.PrevLogIndex - 1; i >= 0 && rf.log[i].Term == term; i-- {
+			reply.NextTryIndex = i + 1
 		}
-		reply.NextTryIndex++
 	} else {
+		// otherwise log up to prevLogIndex are safe.
+		// we can merge lcoal log and entries from leader, and apply log if commitIndex changes.
 		var restLog []LogEntry
 		rf.log, restLog = rf.log[:args.PrevLogIndex+1], rf.log[args.PrevLogIndex+1:]
-
-		if rf.hasConflictLog(args.Entries, restLog) || len(restLog) < len(args.Entries) {
+		if existConflictingEntry(restLog, args.Entries) || len(restLog) < len(args.Entries) {
 			rf.log = append(rf.log, args.Entries...)
 		} else {
 			rf.log = append(rf.log, restLog...)
@@ -348,19 +353,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = true
 		reply.NextTryIndex = args.PrevLogIndex
 
-		if args.LeaderCommit > rf.commitIndex {
-			if rf.getLastLogIndex() < args.LeaderCommit {
-				rf.commitIndex = rf.getLastLogIndex()
-			} else {
-				rf.commitIndex = args.LeaderCommit
-			}
-			go rf.commitLog()
+		if rf.commitIndex < args.LeaderCommit {
+			// update commitIndex and apply log
+			rf.commitIndex = min(args.LeaderCommit, rf.getLastLogIndex())
+			go rf.applyLog()
 		}
 	}
 }
 
-func (rf *Raft) hasConflictLog(leaderLog []LogEntry, localLog []LogEntry) bool {
-	for i := 0; i < len(leaderLog) && i < len(localLog); i++ {
+//
+// check whether there exists an conflict entry between local and leader log
+//
+func existConflictingEntry(localLog []LogEntry, leaderLog []LogEntry) bool {
+	for i := 0; i < min(len(leaderLog), len(localLog)); i++ {
 		if leaderLog[i].Term != localLog[i].Term {
 			return true
 		}
@@ -368,22 +373,41 @@ func (rf *Raft) hasConflictLog(leaderLog []LogEntry, localLog []LogEntry) bool {
 	return false
 }
 
+//
+// apply log entries with index in range [lastApplied + 1, commitIndex]
+//
+func (rf *Raft) applyLog() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+		msg := ApplyMsg{}
+		msg.CommandIndex = i
+		msg.CommandValid = true
+		msg.Command = rf.log[i].Command
+		rf.chanApply <- msg
+	}
+	rf.lastApplied = rf.commitIndex
+}
+
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	if !ok || rf.state != STATE_LEADER || args.Term != rf.currentTerm {
+		// invalid request
 		return ok
 	}
 	if reply.Term > rf.currentTerm {
+		// become follower and update current term
 		rf.currentTerm = reply.Term
 		rf.state = STATE_FOLLOWER
 		rf.votedFor = -1
 		rf.persist()
 		return ok
 	}
+
 	if reply.Success {
 		rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
 		rf.nextIndex[server] = rf.matchIndex[server] + 1
@@ -391,39 +415,22 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		rf.nextIndex[server] = reply.NextTryIndex
 	}
 
-	// If there exists an N such that N > commitIndex, a majority of
-	// matchIndex[i] >= N, and log[N].term == currentTerm: set commitIndex = N
-	for N := rf.getLastLogIndex(); N > rf.commitIndex; N-- {
+	for N := rf.getLastLogIndex(); N > rf.commitIndex && rf.log[N].Term == rf.currentTerm; N-- {
+		// find if there exists an N to update commitIndex
 		count := 1
-
-		if rf.log[N].Term == rf.currentTerm {
-			for i := range rf.peers {
-				if i != rf.me && rf.matchIndex[i] >= N {
-					count++
-				}
+		for i := range rf.peers {
+			if i != rf.me && rf.matchIndex[i] >= N {
+				count++
 			}
 		}
-
 		if count > len(rf.peers)/2 {
-			if rf.commitIndex < N {
-				rf.commitIndex = N
-				go rf.commitLog()
-			}
+			rf.commitIndex = N
+			go rf.applyLog()
 			break
 		}
 	}
 
 	return ok
-}
-
-func (rf *Raft) commitLog() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-		rf.chanApply <- ApplyMsg{CommandIndex: i, CommandValid: true, Command: rf.log[i].Command}
-	}
-	rf.lastApplied = rf.commitIndex
 }
 
 func (rf *Raft) broadcastAppendEntries() {
@@ -467,17 +474,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	term, index := 0, 0
+	term, index := -1, -1
 	isLeader := (rf.state == STATE_LEADER)
 
-	// TODO(problem): leader doesn't have data log
 	if isLeader {
 		term = rf.currentTerm
 		index = rf.getLastLogIndex() + 1
 		rf.log = append(rf.log, LogEntry{Term: term, Command: command})
 	}
-
-	// rf.mu.Unlock()
 
 	return index, term, isLeader
 }
