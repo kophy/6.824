@@ -14,7 +14,7 @@ MIT 6.824: Distributed Systems Spring 2018
 ### Lab 2 Raft
 - [X] 2A
 - [X] 2B
-- [ ] 2C
+- [X] 2C
 
 ### Lab 3 Fault-tolerant Key/Value Service
 - [ ] Key/value service without log compaction
