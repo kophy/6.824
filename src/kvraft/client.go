@@ -1,13 +1,19 @@
 package raftkv
 
-import "labrpc"
-import "crypto/rand"
-import "math/big"
-
+import (
+	"crypto/rand"
+	"labrpc"
+	"math/big"
+	"sync"
+)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	mu        sync.Mutex
+	clientId  int64
+	requestId int
+	leader    int
 }
 
 func nrand() int64 {
@@ -21,6 +27,9 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.clientId = nrand()
+	ck.requestId = 0
+	ck.leader = 0
 	return ck
 }
 
@@ -37,9 +46,24 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
-
 	// You will have to modify this function.
-	return ""
+	args := GetArgs{}
+	args.Key = key
+	args.ClientId = ck.clientId
+	ck.mu.Lock()
+	args.RequestId = ck.requestId
+	ck.requestId++
+	ck.mu.Unlock()
+
+	for {
+		server := ck.servers[ck.leader]
+		reply := GetReply{}
+		ok := server.Call("KVServer.Get", &args, &reply)
+		if ok && !reply.WrongLeader {
+			return reply.Value
+		}
+		ck.leader = (ck.leader + 1) % len(ck.servers)
+	}
 }
 
 //
@@ -54,11 +78,30 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	args := PutAppendArgs{}
+	args.Key = key
+	args.Value = value
+	args.Command = op
+	args.ClientId = ck.clientId
+	ck.mu.Lock()
+	args.RequestId = ck.requestId
+	ck.requestId++
+	ck.mu.Unlock()
+
+	for {
+		server := ck.servers[ck.leader]
+		reply := PutAppendReply{}
+		ok := server.Call("KVServer.PutAppend", &args, &reply)
+		if ok && !reply.WrongLeader {
+			return
+		}
+		ck.leader = (ck.leader + 1) % len(ck.servers)
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
-	ck.PutAppend(key, value, "Put")
+	ck.PutAppend(key, value, "put")
 }
 func (ck *Clerk) Append(key string, value string) {
-	ck.PutAppend(key, value, "Append")
+	ck.PutAppend(key, value, "append")
 }
