@@ -345,13 +345,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else if args.PrevLogIndex >= baseIndex-1 {
 		// otherwise log up to prevLogIndex are safe.
 		// we can merge lcoal log and entries from leader, and apply log if commitIndex changes.
-		var restLog []LogEntry
-		rf.log, restLog = rf.log[:args.PrevLogIndex-baseIndex+1], rf.log[args.PrevLogIndex-baseIndex+1:]
-		if existConflictingEntry(restLog, args.Entries) || len(restLog) < len(args.Entries) {
-			rf.log = append(rf.log, args.Entries...)
-		} else {
-			rf.log = append(rf.log, restLog...)
-		}
+		rf.log = rf.log[:args.PrevLogIndex-baseIndex+1]
+		rf.log = append(rf.log, args.Entries...)
 
 		reply.Success = true
 		reply.NextTryIndex = args.PrevLogIndex + len(args.Entries)
@@ -362,18 +357,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			go rf.applyLog()
 		}
 	}
-}
-
-//
-// check whether there exists an conflict entry between local and leader log
-//
-func existConflictingEntry(localLog []LogEntry, leaderLog []LogEntry) bool {
-	for i := 0; i < min(len(leaderLog), len(localLog)); i++ {
-		if leaderLog[i].Term != localLog[i].Term {
-			return true
-		}
-	}
-	return false
 }
 
 //
