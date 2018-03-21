@@ -108,14 +108,6 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
-func (rf *Raft) GetLogLength() int {
-	return len(rf.log)
-}
-
-func (rf *Raft) GetPeerNumber() int {
-	return len(rf.peers)
-}
-
 func (rf *Raft) getLastLogTerm() int {
 	return rf.log[len(rf.log)-1].Term
 }

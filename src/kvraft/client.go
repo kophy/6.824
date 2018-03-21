@@ -12,7 +12,7 @@ type Clerk struct {
 	// You will have to modify this struct.
 	mu        sync.Mutex
 	clientId  int64
-	requestId int
+	requestId int64
 	leader    int
 }
 

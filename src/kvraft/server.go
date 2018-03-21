@@ -26,7 +26,7 @@ type Op struct {
 	Key       string
 	Value     string
 	ClientId  int64
-	RequestId int
+	RequestId int64
 }
 
 type KVServer struct {
@@ -38,28 +38,31 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	data   map[string]string
-	ack    map[int64]int
-	result map[int]chan Op
+	data   map[string]string // key-value database
+	ack    map[int64]int64   // client's latest request id (for deduplication)
+	notify map[int]chan Op   // log index to notifying chan (for checking status)
 }
 
-func (kv *KVServer) appendEntryToLog(entry Op) bool {
-	index, _, isLeader := kv.rf.Start(entry)
+//
+//
+//
+func (kv *KVServer) appendEntryToLog(op Op) bool {
+	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		return false
 	}
 
 	kv.mu.Lock()
-	ch, ok := kv.result[index]
+	ch, ok := kv.notify[index]
 	if !ok {
 		ch = make(chan Op, 1)
-		kv.result[index] = ch
+		kv.notify[index] = ch
 	}
 	kv.mu.Unlock()
 
 	select {
-	case op := <-ch:
-		return op == entry
+	case appliedOp := <-ch:
+		return op == appliedOp
 	case <-time.After(800 * time.Millisecond):
 		return false
 	}
@@ -82,7 +85,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	reply.Err = OK
 	kv.mu.Lock()
 	reply.Value = kv.data[args.Key]
-	kv.ack[args.ClientId] = args.RequestId
 	kv.mu.Unlock()
 }
 
@@ -104,18 +106,27 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	reply.Err = OK
 }
 
-func (kv *KVServer) applyEntry(entry Op) {
-	switch entry.Command {
+//
+// Apply operation on database.
+//
+func (kv *KVServer) applyOp(op Op) {
+	switch op.Command {
 	case "put":
-		kv.data[entry.Key] = entry.Value
-		DPrintf("PUT (%s, %s), server = %d, log = %d", entry.Key, entry.Value, kv.me, kv.rf.GetLogLength())
+		kv.data[op.Key] = op.Value
 	case "append":
-		kv.data[entry.Key] += entry.Value
-		DPrintf("ADD (%s, %s), server = %d, log = %d", entry.Key, kv.data[entry.Key], kv.me, kv.rf.GetLogLength())
-	case "get":
-		DPrintf("GET (%s, %s), server = %d, log = %d", entry.Key, kv.data[entry.Key], kv.me, kv.rf.GetLogLength())
+		kv.data[op.Key] += op.Value
 	}
-	kv.ack[entry.ClientId] = entry.RequestId
+}
+
+//
+// Check if the request is duplicated with request id.
+//
+func (kv *KVServer) isDuplicate(op Op) bool {
+	latestRequestId, ok := kv.ack[op.ClientId]
+	if ok {
+		return latestRequestId >= op.RequestId
+	}
+	return false
 }
 
 //
@@ -136,17 +147,22 @@ func (kv *KVServer) Run() {
 
 		kv.mu.Lock()
 
-		requestId, ok := kv.ack[op.ClientId]
-		if !ok || requestId < op.RequestId {
-			// TODO(problem may be here!!!)
-			kv.applyEntry(op)
+		if !kv.isDuplicate(op) {
+			kv.applyOp(op)
 			kv.ack[op.ClientId] = op.RequestId
 		}
 
-		ch, ok := kv.result[msg.CommandIndex]
+		ch, ok := kv.notify[msg.CommandIndex]
 		if ok {
-			ch <- op
+			select {
+			case <-ch: // drain bad data
+			default:
+			}
+		} else {
+			ch = make(chan Op, 1)
+			kv.notify[msg.CommandIndex] = ch
 		}
+		ch <- op
 		kv.mu.Unlock()
 	}
 }
@@ -180,8 +196,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.data = make(map[string]string)
-	kv.ack = make(map[int64]int)
-	kv.result = make(map[int]chan Op)
+	kv.ack = make(map[int64]int64)
+	kv.notify = make(map[int]chan Op)
 
 	go kv.Run()
 	return kv
