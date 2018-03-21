@@ -55,14 +55,13 @@ func (ck *Clerk) Get(key string) string {
 	ck.requestId++
 	ck.mu.Unlock()
 
-	for {
+	for ; ; ck.leader = (ck.leader + 1) % len(ck.servers) {
 		server := ck.servers[ck.leader]
 		reply := GetReply{}
 		ok := server.Call("KVServer.Get", &args, &reply)
 		if ok && !reply.WrongLeader {
 			return reply.Value
 		}
-		ck.leader = (ck.leader + 1) % len(ck.servers)
 	}
 }
 
@@ -88,14 +87,13 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	ck.requestId++
 	ck.mu.Unlock()
 
-	for {
+	for ; ; ck.leader = (ck.leader + 1) % len(ck.servers) {
 		server := ck.servers[ck.leader]
 		reply := PutAppendReply{}
 		ok := server.Call("KVServer.PutAppend", &args, &reply)
 		if ok && !reply.WrongLeader {
 			return
 		}
-		ck.leader = (ck.leader + 1) % len(ck.servers)
 	}
 }
 

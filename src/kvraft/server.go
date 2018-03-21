@@ -108,8 +108,12 @@ func (kv *KVServer) applyEntry(entry Op) {
 	switch entry.Command {
 	case "put":
 		kv.data[entry.Key] = entry.Value
+		DPrintf("PUT (%s, %s), server = %d, log = %d", entry.Key, entry.Value, kv.me, kv.rf.GetLogLength())
 	case "append":
 		kv.data[entry.Key] += entry.Value
+		DPrintf("ADD (%s, %s), server = %d, log = %d", entry.Key, kv.data[entry.Key], kv.me, kv.rf.GetLogLength())
+	case "get":
+		DPrintf("GET (%s, %s), server = %d, log = %d", entry.Key, kv.data[entry.Key], kv.me, kv.rf.GetLogLength())
 	}
 	kv.ack[entry.ClientId] = entry.RequestId
 }
@@ -134,6 +138,7 @@ func (kv *KVServer) Run() {
 
 		requestId, ok := kv.ack[op.ClientId]
 		if !ok || requestId < op.RequestId {
+			// TODO(problem may be here!!!)
 			kv.applyEntry(op)
 			kv.ack[op.ClientId] = op.RequestId
 		}

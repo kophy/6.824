@@ -469,7 +469,7 @@ func TestUnreliableOneKey3A(t *testing.T) {
 
 	cfg.end()
 }
-
+//
 // Submit a request in the minority partition and check that the requests
 // doesn't go through until the partition heals.  The leader in the original
 // network ends up in the minority partition.

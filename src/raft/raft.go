@@ -108,6 +108,14 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
+func (rf *Raft) GetLogLength() int {
+	return len(rf.log)
+}
+
+func (rf *Raft) GetPeerNumber() int {
+	return len(rf.peers)
+}
+
 func (rf *Raft) getLastLogTerm() int {
 	return rf.log[len(rf.log)-1].Term
 }
@@ -263,6 +271,13 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 			if rf.voteCount > len(rf.peers)/2 {
 				// win the election
 				rf.state = STATE_LEADER
+				rf.persist()
+				rf.nextIndex = make([]int, len(rf.peers))
+				rf.matchIndex = make([]int, len(rf.peers))
+				nextIndex := rf.getLastLogIndex() + 1
+				for i := range rf.nextIndex {
+					rf.nextIndex[i] = nextIndex
+				}
 				rf.chanWinElect <- true
 			}
 		}
@@ -339,8 +354,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// if entry log[prevLogIndex] conflicts with new one, there may be conflict entries before.
 		// we can bypass all entries during the problematic term to speed up.
 		term := rf.log[args.PrevLogIndex-baseIndex].Term
-		for i := args.PrevLogIndex - 1; i >= baseIndex && rf.log[i-baseIndex].Term == term; i-- {
-			reply.NextTryIndex = i + 1
+		for i := args.PrevLogIndex - 1; i >= baseIndex; i-- {
+			if rf.log[i-baseIndex].Term != term {
+				reply.NextTryIndex = i + 1
+				break
+			}
 		}
 	} else if args.PrevLogIndex >= baseIndex-1 {
 		// otherwise log up to prevLogIndex are safe.
@@ -402,7 +420,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 			rf.matchIndex[server] = rf.nextIndex[server] - 1
 		}
 	} else {
-		rf.nextIndex[server] = reply.NextTryIndex
+		rf.nextIndex[server] = min(reply.NextTryIndex, rf.getLastLogIndex())
 	}
 
 	baseIndex := rf.log[0].Index
@@ -518,14 +536,6 @@ func (rf *Raft) Run() {
 			case <-rf.chanHeartbeat:
 				rf.state = STATE_FOLLOWER
 			case <-rf.chanWinElect:
-				rf.mu.Lock()
-				rf.nextIndex = make([]int, len(rf.peers))
-				rf.matchIndex = make([]int, len(rf.peers))
-				nextIndex := rf.getLastLogIndex() + 1
-				for i := range rf.nextIndex {
-					rf.nextIndex[i] = nextIndex
-				}
-				rf.mu.Unlock()
 			case <-time.After(time.Millisecond * time.Duration(rand.Intn(200)+300)):
 			}
 		}
