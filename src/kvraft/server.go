@@ -23,7 +23,7 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Command   string // get | put | append
+	Command   string // "get" | "put" | "append"
 	Key       string
 	Value     string
 	ClientId  int64
@@ -125,10 +125,10 @@ func (kv *KVServer) applyOp(op Op) {
 // Apply snapshot on database.
 //
 func (kv *KVServer) applySnapshot(snapshot []byte) {
-	var lastIncludedIndex, lastIncludedTerm int
 	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
 
+	var lastIncludedIndex, lastIncludedTerm int
 	d.Decode(&lastIncludedIndex)
 	d.Decode(&lastIncludedTerm)
 	d.Decode(&kv.data)
@@ -165,9 +165,9 @@ func (kv *KVServer) Run() {
 		if msg.UseSnapshot {
 			kv.applySnapshot(msg.Snapshot)
 		} else {
-			// apply operation if it is not duplicate request
 			op := msg.Command.(Op)
 			if !kv.isDuplicate(op) {
+				// apply operation if it is not duplicate request
 				kv.applyOp(op)
 			}
 
@@ -185,7 +185,7 @@ func (kv *KVServer) Run() {
 			ch <- op
 
 			// create snapshot if raft state exceeds allowed size
-			if kv.maxraftstate != -1 && kv.rf.GetStateSize() > kv.maxraftstate {
+			if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() > kv.maxraftstate {
 				w := new(bytes.Buffer)
 				e := labgob.NewEncoder(w)
 				e.Encode(kv.data)

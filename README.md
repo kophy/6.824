@@ -18,7 +18,7 @@ MIT 6.824: Distributed Systems Spring 2018
 
 ### Lab 3 Fault-tolerant Key/Value Service
 - [X] Key/value service without log compaction
-- [ ] Key/value service with log compaction
+- [X] Key/value service with log compaction
 
 ### Lab 4 Sharded Key/Value Service
 - [ ] The Shard Master

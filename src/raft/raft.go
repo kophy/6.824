@@ -111,10 +111,6 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
-func (rf *Raft) GetStateSize() int {
-	return rf.persister.RaftStateSize()
-}
-
 func (rf *Raft) getLastLogTerm() int {
 	return rf.log[len(rf.log)-1].Term
 }
@@ -135,15 +131,6 @@ func (rf *Raft) persist() {
 	rf.persister.SaveRaftState(data)
 }
 
-func (rf *Raft) getRaftState() []byte {
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	e.Encode(rf.currentTerm)
-	e.Encode(rf.votedFor)
-	e.Encode(rf.log)
-	return w.Bytes()
-}
-
 //
 // restore previously persisted state.
 //
@@ -158,6 +145,49 @@ func (rf *Raft) readPersist(data []byte) {
 	d.Decode(&rf.currentTerm)
 	d.Decode(&rf.votedFor)
 	d.Decode(&rf.log)
+}
+
+//
+// encode current raft state.
+//
+func (rf *Raft) getRaftState() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	return w.Bytes()
+}
+
+//
+// get previous encoded raft state size.
+//
+func (rf *Raft) GetRaftStateSize() int {
+	return rf.persister.RaftStateSize()
+}
+
+//
+// append raft information to kv server snapshot and save whole snapshot.
+// the snapshot will include changes up to log entry with given index.
+//
+func (rf *Raft) CreateSnapshot(kvSnapshot []byte, index int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	baseIndex, lastIndex := rf.log[0].Index, rf.getLastLogIndex()
+	if index <= baseIndex || index > lastIndex {
+		// can't trim log since index is invalid
+		return
+	}
+	rf.trimLog(index, rf.log[index-baseIndex].Term)
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.log[0].Index)
+	e.Encode(rf.log[0].Term)
+	snapshot := append(w.Bytes(), kvSnapshot...)
+
+	rf.persister.SaveStateAndSnapshot(rf.getRaftState(), snapshot)
 }
 
 //
@@ -176,8 +206,9 @@ func (rf *Raft) recoverFromSnapshot(snapshot []byte) {
 
 	rf.lastApplied = lastIncludedIndex
 	rf.commitIndex = lastIncludedIndex
-	rf.log = rf.trimLog(lastIncludedIndex, lastIncludedTerm)
+	rf.trimLog(lastIncludedIndex, lastIncludedTerm)
 
+	// send snapshot to kv server
 	msg := ApplyMsg{UseSnapshot: true, Snapshot: snapshot}
 	rf.chanApply <- msg
 }
@@ -202,11 +233,6 @@ type RequestVoteReply struct {
 	// Your data here (2A).
 	Term        int
 	VoteGranted bool
-}
-
-func (rf *Raft) isUpToDate(candidateTerm int, candidateIndex int) bool {
-	term, index := rf.getLastLogTerm(), rf.getLastLogIndex()
-	return candidateTerm > term || (candidateTerm == term && candidateIndex >= index)
 }
 
 //
@@ -241,6 +267,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		rf.chanGrantVote <- true
 	}
+}
+
+//
+// check if candidate's log is at least as new as the voter.
+//
+func (rf *Raft) isUpToDate(candidateTerm int, candidateIndex int) bool {
+	term, index := rf.getLastLogTerm(), rf.getLastLogIndex()
+	return candidateTerm > term || (candidateTerm == term && candidateIndex >= index)
 }
 
 //
@@ -377,7 +411,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if args.PrevLogIndex >= baseIndex && args.PrevLogTerm != rf.log[args.PrevLogIndex-baseIndex].Term {
 		// if entry log[prevLogIndex] conflicts with new one, there may be conflict entries before.
-		// we can bypass all entries during the problematic term to speed up.
+		// bypass all entries during the problematic term to speed up.
 		term := rf.log[args.PrevLogIndex-baseIndex].Term
 		for i := args.PrevLogIndex - 1; i >= baseIndex; i-- {
 			if rf.log[i-baseIndex].Term != term {
@@ -387,7 +421,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	} else if args.PrevLogIndex >= baseIndex-1 {
 		// otherwise log up to prevLogIndex are safe.
-		// we can merge lcoal log and entries from leader, and apply log if commitIndex changes.
+		// merge lcoal log and entries from leader, and apply log if commitIndex changes.
 		rf.log = rf.log[:args.PrevLogIndex-baseIndex+1]
 		rf.log = append(rf.log, args.Entries...)
 
@@ -449,7 +483,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	}
 
 	baseIndex := rf.log[0].Index
-
 	for N := rf.getLastLogIndex(); N > rf.commitIndex && rf.log[N-baseIndex].Term == rf.currentTerm; N-- {
 		// find if there exists an N to update commitIndex
 		count := 1
@@ -474,7 +507,6 @@ type InstallSnapshotArgs struct {
 	LastIncludedIndex int
 	LastIncludedTerm  int
 	Data              []byte
-	Done              bool
 }
 
 type InstallSnapshotReply struct {
@@ -505,20 +537,21 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	reply.Term = rf.currentTerm
 
 	if args.LastIncludedIndex > rf.commitIndex {
-		rf.log = rf.trimLog(args.LastIncludedIndex, args.LastIncludedTerm)
+		rf.trimLog(args.LastIncludedIndex, args.LastIncludedTerm)
 		rf.lastApplied = args.LastIncludedIndex
 		rf.commitIndex = args.LastIncludedIndex
 		rf.persister.SaveStateAndSnapshot(rf.getRaftState(), args.Data)
 
+		// send snapshot to kv server
 		msg := ApplyMsg{UseSnapshot: true, Snapshot: args.Data}
 		rf.chanApply <- msg
 	}
 }
 
 //
-// remove old log entries up to lastIncludedIndex.
+// discard old log entries up to lastIncludedIndex.
 //
-func (rf *Raft) trimLog(lastIncludedIndex int, lastIncludedTerm int) []LogEntry {
+func (rf *Raft) trimLog(lastIncludedIndex int, lastIncludedTerm int) {
 	newLog := make([]LogEntry, 0)
 	newLog = append(newLog, LogEntry{Index: lastIncludedIndex, Term: lastIncludedTerm})
 
@@ -528,31 +561,7 @@ func (rf *Raft) trimLog(lastIncludedIndex int, lastIncludedTerm int) []LogEntry 
 			break
 		}
 	}
-	return newLog
-}
-
-//
-// append raft information to kv server snapshot and save whole snapshot.
-// the snapshot will include changes up to log entry with given index.
-//
-func (rf *Raft) CreateSnapshot(kvSnapshot []byte, index int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	baseIndex, lastIndex := rf.log[0].Index, rf.getLastLogIndex()
-	if index <= baseIndex || index > lastIndex {
-		return
-	}
-
-	rf.log = rf.trimLog(index, rf.log[index-baseIndex].Term)
-
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	e.Encode(rf.log[0].Index)
-	e.Encode(rf.log[0].Term)
-	snapshot := append(w.Bytes(), kvSnapshot...)
-
-	rf.persister.SaveStateAndSnapshot(rf.getRaftState(), snapshot)
+	rf.log = newLog
 }
 
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
@@ -564,6 +573,7 @@ func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply
 		// invalid request
 		return ok
 	}
+
 	if reply.Term > rf.currentTerm {
 		// become follower and update current term
 		rf.currentTerm = reply.Term
@@ -578,7 +588,12 @@ func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply
 	return ok
 }
 
-func (rf *Raft) broadcastAppendEntries() {
+//
+// broadcast heartbeat to all followers.
+// the heartbeat may be AppendEntries or InstallSnapshot depending on whether
+// required log entry is discarded.
+//
+func (rf *Raft) broadcastHeartbeat() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -642,7 +657,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.log = append(rf.log, LogEntry{Index: index, Term: term, Command: command})
 		rf.persist()
 	}
-
 	return index, term, isLeader
 }
 
@@ -668,7 +682,7 @@ func (rf *Raft) Run() {
 				rf.persist()
 			}
 		case STATE_LEADER:
-			go rf.broadcastAppendEntries()
+			go rf.broadcastHeartbeat()
 			time.Sleep(time.Millisecond * 60)
 		case STATE_CANDIDATE:
 			rf.mu.Lock()
