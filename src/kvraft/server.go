@@ -1,6 +1,7 @@
 package raftkv
 
 import (
+	"bytes"
 	"labgob"
 	"labrpc"
 	"log"
@@ -9,7 +10,7 @@ import (
 	"time"
 )
 
-const Debug = 0
+const Debug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -38,16 +39,17 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	data   map[string]string // key-value database
+	data   map[string]string // key-value data
 	ack    map[int64]int64   // client's latest request id (for deduplication)
 	notify map[int]chan Op   // log index to notifying chan (for checking status)
 }
 
 //
+// try to append an entry to raft servers' log.
+// return true if raft servers apply this entry before timeout.
 //
-//
-func (kv *KVServer) appendEntryToLog(op Op) bool {
-	index, _, isLeader := kv.rf.Start(op)
+func (kv *KVServer) appendEntryToLog(entry Op) bool {
+	index, _, isLeader := kv.rf.Start(entry)
 	if !isLeader {
 		return false
 	}
@@ -61,9 +63,9 @@ func (kv *KVServer) appendEntryToLog(op Op) bool {
 	kv.mu.Unlock()
 
 	select {
-	case appliedOp := <-ch:
-		return op == appliedOp
-	case <-time.After(800 * time.Millisecond):
+	case appliedEntry := <-ch:
+		return entry == appliedEntry
+	case <-time.After(240 * time.Millisecond):
 		return false
 	}
 }
@@ -116,6 +118,21 @@ func (kv *KVServer) applyOp(op Op) {
 	case "append":
 		kv.data[op.Key] += op.Value
 	}
+	kv.ack[op.ClientId] = op.RequestId
+}
+
+//
+// Apply snapshot on database.
+//
+func (kv *KVServer) applySnapshot(snapshot []byte) {
+	var lastIncludedIndex, lastIncludedTerm int
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+
+	d.Decode(&lastIncludedIndex)
+	d.Decode(&lastIncludedTerm)
+	d.Decode(&kv.data)
+	d.Decode(&kv.ack)
 }
 
 //
@@ -143,26 +160,39 @@ func (kv *KVServer) Kill() {
 func (kv *KVServer) Run() {
 	for {
 		msg := <-kv.applyCh
-		op := msg.Command.(Op)
-
 		kv.mu.Lock()
 
-		if !kv.isDuplicate(op) {
-			kv.applyOp(op)
-			kv.ack[op.ClientId] = op.RequestId
-		}
-
-		ch, ok := kv.notify[msg.CommandIndex]
-		if ok {
-			select {
-			case <-ch: // drain bad data
-			default:
-			}
+		if msg.UseSnapshot {
+			kv.applySnapshot(msg.Snapshot)
 		} else {
-			ch = make(chan Op, 1)
-			kv.notify[msg.CommandIndex] = ch
+			// apply operation if it is not duplicate request
+			op := msg.Command.(Op)
+			if !kv.isDuplicate(op) {
+				kv.applyOp(op)
+			}
+
+			// send success notification (even for duplicate request)
+			ch, ok := kv.notify[msg.CommandIndex]
+			if ok {
+				select {
+				case <-ch: // drain bad data
+				default:
+				}
+			} else {
+				ch = make(chan Op, 1)
+				kv.notify[msg.CommandIndex] = ch
+			}
+			ch <- op
+
+			// create snapshot if raft state exceeds allowed size
+			if kv.maxraftstate != -1 && kv.rf.GetStateSize() > kv.maxraftstate {
+				w := new(bytes.Buffer)
+				e := labgob.NewEncoder(w)
+				e.Encode(kv.data)
+				e.Encode(kv.ack)
+				go kv.rf.CreateSnapshot(w.Bytes(), msg.CommandIndex)
+			}
 		}
-		ch <- op
 		kv.mu.Unlock()
 	}
 }
@@ -190,8 +220,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
-
-	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.applyCh = make(chan raft.ApplyMsg, 100)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
