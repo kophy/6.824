@@ -1,11 +1,13 @@
 package shardmaster
 
-import "raft"
-import "labrpc"
-import "sync"
-import "labgob"
-import "time"
-import "log"
+import (
+	"labgob"
+	"labrpc"
+	"log"
+	"raft"
+	"sync"
+	"time"
+)
 
 const Debug = 1
 
@@ -22,11 +24,11 @@ type ShardMaster struct {
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
 
-	// Your data here.
-	ack    map[int64]int64
-	notify map[int]chan Op
-
 	configs []Config // indexed by config num
+
+	// Your data here.
+	ack    map[int64]int64 // client's latest request id (for deduplication)
+	notify map[int]chan Op // log index to notifying chan (for checking status)
 }
 
 type Op struct {
@@ -34,10 +36,10 @@ type Op struct {
 	Command   string
 	ClientId  int64
 	RequestId int64
-	Args      interface{}
+	Args      interface{} // save whole request args for simplicity.
 }
 
-func (sm *ShardMaster) getLatestConfig() *Config {
+func (sm *ShardMaster) getCurrentConfig() *Config {
 	return &sm.configs[len(sm.configs)-1]
 }
 
@@ -52,19 +54,24 @@ func (sm *ShardMaster) appendEntryToLog(entry Op) bool {
 	}
 
 	sm.mu.Lock()
-	ch, ok := sm.notify[index]
-	if !ok {
-		ch = make(chan Op, 1)
-		sm.notify[index] = ch
+	if _, ok := sm.notify[index]; !ok {
+		sm.notify[index] = make(chan Op, 1)
 	}
 	sm.mu.Unlock()
 
 	select {
-	case appliedEntry := <-ch:
-		return entry.ClientId == appliedEntry.ClientId && entry.RequestId == appliedEntry.RequestId
+	case appliedEntry := <-sm.notify[index]:
+		return isEqualEntry(entry, appliedEntry)
 	case <-time.After(240 * time.Millisecond):
 		return false
 	}
+}
+
+//
+// check if two entries are equal(with same client id and request id).
+//
+func isEqualEntry(entry1 Op, entry2 Op) bool {
+	return entry1.ClientId == entry2.ClientId && entry1.RequestId == entry2.RequestId
 }
 
 func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
@@ -143,40 +150,135 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 }
 
 //
-// Apply operation on configuration.
+// apply operation on configuration.
 //
 func (sm *ShardMaster) applyOp(op Op) {
 	switch op.Command {
 	case "join":
 		args := op.Args.(JoinArgs)
-		sm.makeNextConfig()
-		sm.applyJoin(args)
+		config := sm.makeNextConfig()
+		applyJoin(&config, args)
+		sm.configs = append(sm.configs, config)
 	case "leave":
 		args := op.Args.(LeaveArgs)
-		sm.makeNextConfig()
-		sm.applyLeave(args)
+		config := sm.makeNextConfig()
+		applyLeave(&config, args)
+		sm.configs = append(sm.configs, config)
 	case "move":
 		args := op.Args.(MoveArgs)
-		sm.makeNextConfig()
-		sm.applyMove(args)
+		config := sm.makeNextConfig()
+		applyMove(&config, args)
+		sm.configs = append(sm.configs, config)
 	case "get":
 	}
 	sm.ack[op.ClientId] = op.RequestId
 }
 
-func (sm *ShardMaster) makeNextConfig() {
-	config := Config{}
-	config.Num = len(sm.configs)
-	config.Shards = sm.configs[len(sm.configs)-1].Shards
-	config.Groups = map[int][]string{}
-	for k, v := range sm.configs[len(sm.configs)-1].Groups {
-		config.Groups[k] = v
+//
+// make a new configuration from current configuration.
+// all fields are same as current configuration except config number.
+//
+func (sm *ShardMaster) makeNextConfig() Config {
+	nextConfig := Config{}
+	currConfig := sm.getCurrentConfig()
+
+	nextConfig.Num = currConfig.Num + 1
+	nextConfig.Shards = currConfig.Shards
+	nextConfig.Groups = map[int][]string{}
+	for gid, servers := range currConfig.Groups {
+		nextConfig.Groups[gid] = servers
 	}
-	sm.configs = append(sm.configs, config)
+	return nextConfig
 }
 
-func (sm *ShardMaster) makeGidToShards() map[int][]int {
-	config := sm.getLatestConfig()
+//
+// apply join request to modify config.
+//
+func applyJoin(config *Config, args JoinArgs) {
+	for gid, servers := range args.Servers {
+		config.Groups[gid] = servers
+
+		// assign shards without replica group to this replica group.
+		for i := 0; i < NShards; i++ {
+			if config.Shards[i] == 0 {
+				config.Shards[i] = gid
+			}
+		}
+	}
+	rebalanceShards(config)
+}
+
+//
+// apply leave request to modify config.
+//
+func applyLeave(config *Config, args LeaveArgs) {
+	// find a replica group won't leave.
+	stayGid := 0
+	for gid := range config.Groups {
+		stay := true
+		for _, deletedGid := range args.GIDs {
+			if gid == deletedGid {
+				stay = false
+			}
+		}
+		if stay {
+			stayGid = gid
+			break
+		}
+	}
+
+	for _, gid := range args.GIDs {
+		// assign shards whose replica group will leave to the stay group.
+		for i := 0; i < len(config.Shards); i++ {
+			if config.Shards[i] == gid {
+				config.Shards[i] = stayGid
+			}
+		}
+		delete(config.Groups, gid)
+	}
+	rebalanceShards(config)
+}
+
+//
+// apply move request to modify config.
+//
+func applyMove(config *Config, args MoveArgs) {
+	config.Shards[args.Shard] = args.GID
+}
+
+//
+// rebalance shards among replica groups.
+//
+func rebalanceShards(config *Config) {
+	gidToShards := makeGidToShards(config)
+	if len(config.Groups) == 0 {
+		// no replica group
+		for i := 0; i < len(config.Shards); i++ {
+			config.Shards[i] = 0
+		}
+	} else {
+		mean := NShards / len(config.Groups)
+		numToMove := 0
+		for _, shards := range gidToShards {
+			if len(shards) > mean {
+				numToMove += len(shards) - mean
+			}
+		}
+		for i := 0; i < numToMove; i++ {
+			// each time move a shard from replica group with most shards to replica
+			// gorup with fewest shards.
+			srcGid, dstGid := getGidPairToMove(gidToShards)
+			config.Shards[gidToShards[srcGid][0]] = dstGid
+			gidToShards[dstGid] = append(gidToShards[dstGid], gidToShards[srcGid][0])
+			gidToShards[srcGid] = gidToShards[srcGid][1:]
+		}
+	}
+}
+
+//
+// make a map from replica gorup id to the shards they handle.
+//
+func makeGidToShards(config *Config) map[int][]int {
 	gidToShards := make(map[int][]int)
 	for gid := range config.Groups {
 		gidToShards[gid] = make([]int, 0)
@@ -187,122 +289,22 @@ func (sm *ShardMaster) makeGidToShards() map[int][]int {
 	return gidToShards
 }
 
-func getGidWithMaxShards(gidToShards map[int][]int) int {
-	maxGid := -1
-	for gid, shards := range gidToShards {
-		if maxGid == -1 || len(gidToShards[maxGid]) < len(shards) {
-			maxGid = gid
-		}
-	}
-	return maxGid
-}
-
-func getGidWithMinShards(gidToShards map[int][]int) int {
-	minGid := -1
-	for gid, shards := range gidToShards {
-		if minGid == -1 || len(gidToShards[minGid]) > len(shards) {
-			minGid = gid
-		}
-	}
-	return minGid
-}
-
-func (sm *ShardMaster) applyJoin(args JoinArgs) {
-	config := sm.getLatestConfig()
-	for gid, servers := range args.Servers {
-		config.Groups[gid] = servers
-		for i := range config.Shards {
-			if config.Shards[i] == 0 {
-				config.Shards[i] = gid
-			}
-		}
-	}
-	gidToShards := sm.makeGidToShards()
-	if len(config.Groups) == 0 {
-		for i := 0; i < len(config.Shards); i++ {
-			config.Shards[i] = 0
-		}
-	} else {
-		mean := NShards / len(config.Groups)
-		numToMove := 0
-		for _, shards := range gidToShards {
-			if len(shards) > mean {
-				numToMove += len(shards) - mean
-			}
-		}
-		for i := 0; i < numToMove; i++ {
-			maxGid := getGidWithMaxShards(gidToShards)
-			minGid := getGidWithMinShards(gidToShards)
-			config.Shards[gidToShards[maxGid][0]] = minGid
-			gidToShards[minGid] = append(gidToShards[minGid], gidToShards[maxGid][0])
-			gidToShards[maxGid] = gidToShards[maxGid][1:]
-		}
-	}
-}
-
-func (sm *ShardMaster) applyLeave(args LeaveArgs) {
-	config := sm.getLatestConfig()
-
-	tempGid := 0
-	for gid := range config.Groups {
-		flag := true
-		for _, deletedGid := range args.GIDs {
-			if gid == deletedGid {
-				flag = false
-			}
-		}
-		if flag {
-			tempGid = gid
-			break
-		}
-	}
-
-	for _, gid := range args.GIDs {
-		for i := 0; i < len(config.Shards); i++ {
-			if config.Shards[i] == gid {
-				config.Shards[i] = tempGid
-			}
-		}
-		delete(config.Groups, gid)
-	}
-
-	gidToShards := sm.makeGidToShards()
-	if len(config.Groups) == 0 {
-		for i := 0; i < len(config.Shards); i++ {
-			config.Shards[i] = 0
-		}
-	} else {
-		mean := NShards / len(config.Groups)
-		numToMove := 0
-		for _, shards := range gidToShards {
-			if len(shards) > mean {
-				numToMove += len(shards) - mean
-			}
-		}
-		for i := 0; i < numToMove; i++ {
-			maxGid := getGidWithMaxShards(gidToShards)
-			minGid := getGidWithMinShards(gidToShards)
-			config.Shards[gidToShards[maxGid][0]] = minGid
-			gidToShards[minGid] = append(gidToShards[minGid], gidToShards[maxGid][0])
-			gidToShards[maxGid] = gidToShards[maxGid][1:]
-		}
-	}
-}
-
-func (sm *ShardMaster) applyMove(args MoveArgs) {
-	config := sm.getLatestConfig()
-	config.Shards[args.Shard] = args.GID
-}
-
 //
-// Check if the request is duplicated with request id.
+// find a pair of gids (srcGid, dstGid) to move one shard.
+// here srcGid replica group has most shards, while dstGid replica group has
+// fewest shards.
 //
-func (sm *ShardMaster) isDuplicate(op Op) bool {
-	latestRequestId, ok := sm.ack[op.ClientId]
-	if ok {
-		return latestRequestId >= op.RequestId
+func getGidPairToMove(gidToShards map[int][]int) (int, int) {
+	srcGid, dstGid := 0, 0
+	for gid, shards := range gidToShards {
+		if srcGid == 0 || len(gidToShards[srcGid]) < len(shards) {
+			srcGid = gid
+		}
+		if dstGid == 0 || len(gidToShards[dstGid]) > len(shards) {
+			dstGid = gid
+		}
 	}
-	return false
+	return srcGid, dstGid
 }
 
 //
@@ -333,19 +335,27 @@ func (sm *ShardMaster) Run() {
 		}
 
 		// send success notification (even for duplicate request)
-		ch, ok := sm.notify[msg.CommandIndex]
-		if ok {
+		if ch, ok := sm.notify[msg.CommandIndex]; ok {
 			select {
-			case <-ch:
+			case <-ch: // drain bad data
 			default:
 			}
 		} else {
-			ch = make(chan Op, 1)
-			sm.notify[msg.CommandIndex] = ch
+			sm.notify[msg.CommandIndex] = make(chan Op, 1)
 		}
-		ch <- op
+		sm.notify[msg.CommandIndex] <- op
 		sm.mu.Unlock()
 	}
+}
+
+//
+// check if the request is duplicated with request id.
+//
+func (sm *ShardMaster) isDuplicate(op Op) bool {
+	if latestRequestId, ok := sm.ack[op.ClientId]; ok {
+		return latestRequestId >= op.RequestId
+	}
+	return false
 }
 
 //
@@ -370,14 +380,10 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	labgob.Register(LeaveArgs{})
 	labgob.Register(MoveArgs{})
 	labgob.Register(QueryArgs{})
-	labgob.Register(JoinReply{})
-	labgob.Register(LeaveReply{})
-	labgob.Register(MoveReply{})
-	labgob.Register(QueryReply{})
+
 	sm.ack = make(map[int64]int64)
 	sm.notify = make(map[int]chan Op)
 
 	go sm.Run()
-
 	return sm
 }
