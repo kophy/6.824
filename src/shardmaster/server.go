@@ -58,10 +58,6 @@ type Result struct {
 	Config Config
 }
 
-func (sm *ShardMaster) getCurrentConfig() Config {
-	return sm.configs[len(sm.configs)-1]
-}
-
 //
 // try to append the entry to raft servers' log and return result.
 // result is valid if raft servers apply this entry before timeout.
@@ -222,7 +218,7 @@ func (sm *ShardMaster) isDuplicated(op Op) bool {
 //
 func (sm *ShardMaster) makeNextConfig() Config {
 	nextConfig := Config{}
-	currConfig := sm.getCurrentConfig()
+	currConfig := sm.configs[len(sm.configs)-1]
 
 	nextConfig.Num = currConfig.Num + 1
 	nextConfig.Shards = currConfig.Shards

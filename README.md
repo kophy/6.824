@@ -21,5 +21,5 @@ MIT 6.824: Distributed Systems Spring 2018
 - [X] Key/value service with log compaction
 
 ### Lab 4 Sharded Key/Value Service
-- [ ] The Shard Master
+- [X] The Shard Master
 - [ ] Sharded Key/Value Server
