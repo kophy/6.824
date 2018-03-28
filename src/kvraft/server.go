@@ -24,10 +24,20 @@ type Op struct {
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
 	Command   string // "get" | "put" | "append"
-	Key       string
-	Value     string
 	ClientId  int64
 	RequestId int64
+	Key       string
+	Value     string
+}
+
+type Result struct {
+	Command     string
+	OK          bool
+	ClientId    int64
+	RequestId   int64
+	WrongLeader bool
+	Err         Err
+	Value       string
 }
 
 type KVServer struct {
@@ -39,109 +49,122 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	data   map[string]string // key-value data
-	ack    map[int64]int64   // client's latest request id (for deduplication)
-	notify map[int]chan Op   // log index to notifying chan (for checking status)
+	data     map[string]string   // key-value data
+	ack      map[int64]int64     // client's latest request id (for deduplication)
+	resultCh map[int]chan Result // log index to result of applying that entry
 }
 
 //
-// try to append an entry to raft servers' log.
-// return true if raft servers apply this entry before timeout.
+// try to append the entry to raft servers' log and return result.
+// result is valid if raft servers apply this entry before timeout.
 //
-func (kv *KVServer) appendEntryToLog(entry Op) bool {
+func (kv *KVServer) appendEntryToLog(entry Op) Result {
 	index, _, isLeader := kv.rf.Start(entry)
 	if !isLeader {
-		return false
+		return Result{OK: false}
 	}
 
 	kv.mu.Lock()
-	ch, ok := kv.notify[index]
-	if !ok {
-		ch = make(chan Op, 1)
-		kv.notify[index] = ch
+	if _, ok := kv.resultCh[index]; !ok {
+		kv.resultCh[index] = make(chan Result, 1)
 	}
 	kv.mu.Unlock()
 
 	select {
-	case appliedEntry := <-ch:
-		return entry == appliedEntry
+	case result := <-kv.resultCh[index]:
+		if isMatch(entry, result) {
+			return result
+		}
+		return Result{OK: false}
 	case <-time.After(240 * time.Millisecond):
-		return false
+		return Result{OK: false}
 	}
+}
+
+//
+// check if the result corresponds to the log entry.
+//
+func isMatch(entry Op, result Result) bool {
+	return entry.ClientId == result.ClientId && entry.RequestId == result.RequestId
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	entry := Op{}
 	entry.Command = "get"
-	entry.Key = args.Key
 	entry.ClientId = args.ClientId
 	entry.RequestId = args.RequestId
+	entry.Key = args.Key
 
-	ok := kv.appendEntryToLog(entry)
-	if !ok {
+	result := kv.appendEntryToLog(entry)
+	if !result.OK {
 		reply.WrongLeader = true
 		return
 	}
 	reply.WrongLeader = false
-	reply.Err = OK
-	kv.mu.Lock()
-	reply.Value = kv.data[args.Key]
-	kv.mu.Unlock()
+	reply.Err = result.Err
+	reply.Value = result.Value
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	entry := Op{}
 	entry.Command = args.Command
-	entry.Key = args.Key
-	entry.Value = args.Value
 	entry.ClientId = args.ClientId
 	entry.RequestId = args.RequestId
+	entry.Key = args.Key
+	entry.Value = args.Value
 
-	ok := kv.appendEntryToLog(entry)
-	if !ok {
+	result := kv.appendEntryToLog(entry)
+	if !result.OK {
 		reply.WrongLeader = true
 		return
 	}
 	reply.WrongLeader = false
-	reply.Err = OK
+	reply.Err = result.Err
 }
 
 //
-// Apply operation on database.
+// apply operation on database and return result.
 //
-func (kv *KVServer) applyOp(op Op) {
+func (kv *KVServer) applyOp(op Op) Result {
+	result := Result{}
+	result.Command = op.Command
+	result.OK = true
+	result.WrongLeader = false
+	result.ClientId = op.ClientId
+	result.RequestId = op.RequestId
+
 	switch op.Command {
 	case "put":
-		kv.data[op.Key] = op.Value
+		if !kv.isDuplicated(op) {
+			kv.data[op.Key] = op.Value
+		}
+		result.Err = OK
 	case "append":
-		kv.data[op.Key] += op.Value
+		if !kv.isDuplicated(op) {
+			kv.data[op.Key] += op.Value
+		}
+		result.Err = OK
+	case "get":
+		if value, ok := kv.data[op.Key]; ok {
+			result.Err = OK
+			result.Value = value
+		} else {
+			result.Err = ErrNoKey
+		}
 	}
 	kv.ack[op.ClientId] = op.RequestId
+	return result
 }
 
 //
-// Apply snapshot on database.
+// check if the request is duplicated with request id.
 //
-func (kv *KVServer) applySnapshot(snapshot []byte) {
-	r := bytes.NewBuffer(snapshot)
-	d := labgob.NewDecoder(r)
-
-	var lastIncludedIndex, lastIncludedTerm int
-	d.Decode(&lastIncludedIndex)
-	d.Decode(&lastIncludedTerm)
-	d.Decode(&kv.data)
-	d.Decode(&kv.ack)
-}
-
-//
-// Check if the request is duplicated with request id.
-//
-func (kv *KVServer) isDuplicate(op Op) bool {
-	latestRequestId, ok := kv.ack[op.ClientId]
+func (kv *KVServer) isDuplicated(op Op) bool {
+	lastRequestId, ok := kv.ack[op.ClientId]
 	if ok {
-		return latestRequestId >= op.RequestId
+		return lastRequestId >= op.RequestId
 	}
 	return false
 }
@@ -161,28 +184,28 @@ func (kv *KVServer) Run() {
 	for {
 		msg := <-kv.applyCh
 		kv.mu.Lock()
-
 		if msg.UseSnapshot {
-			kv.applySnapshot(msg.Snapshot)
-		} else {
-			op := msg.Command.(Op)
-			if !kv.isDuplicate(op) {
-				// apply operation if it is not duplicate request
-				kv.applyOp(op)
-			}
+			r := bytes.NewBuffer(msg.Snapshot)
+			d := labgob.NewDecoder(r)
 
-			// send success notification (even for duplicate request)
-			ch, ok := kv.notify[msg.CommandIndex]
-			if ok {
+			var lastIncludedIndex, lastIncludedTerm int
+			d.Decode(&lastIncludedIndex)
+			d.Decode(&lastIncludedTerm)
+			d.Decode(&kv.data)
+			d.Decode(&kv.ack)
+		} else {
+			// apply operation and send result
+			op := msg.Command.(Op)
+			result := kv.applyOp(op)
+			if ch, ok := kv.resultCh[msg.CommandIndex]; ok {
 				select {
 				case <-ch: // drain bad data
 				default:
 				}
 			} else {
-				ch = make(chan Op, 1)
-				kv.notify[msg.CommandIndex] = ch
+				kv.resultCh[msg.CommandIndex] = make(chan Result, 1)
 			}
-			ch <- op
+			kv.resultCh[msg.CommandIndex] <- result
 
 			// create snapshot if raft state exceeds allowed size
 			if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() > kv.maxraftstate {
@@ -214,6 +237,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
+	labgob.Register(Result{})
 
 	kv := new(KVServer)
 	kv.me = me
@@ -226,7 +250,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 	kv.data = make(map[string]string)
 	kv.ack = make(map[int64]int64)
-	kv.notify = make(map[int]chan Op)
+	kv.resultCh = make(map[int]chan Result)
 
 	go kv.Run()
 	return kv

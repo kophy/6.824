@@ -27,8 +27,8 @@ type ShardMaster struct {
 	configs []Config // indexed by config num
 
 	// Your data here.
-	ack    map[int64]int64 // client's latest request id (for deduplication)
-	notify map[int]chan Op // log index to notifying chan (for checking status)
+	ack      map[int64]int64     // client's latest request id (for deduplication)
+	resultCh map[int]chan Result // log index to notifying chan (for checking status)
 }
 
 type Op struct {
@@ -36,42 +36,64 @@ type Op struct {
 	Command   string
 	ClientId  int64
 	RequestId int64
-	Args      interface{} // save whole request args for simplicity.
+	// JoinArgs
+	Servers map[int][]string
+	// LeaveArgs
+	GIDs []int
+	// MoveArgs
+	Shard int
+	GID   int
+	// QueryArgs
+	Num int
 }
 
-func (sm *ShardMaster) getCurrentConfig() *Config {
-	return &sm.configs[len(sm.configs)-1]
+type Result struct {
+	Command     string
+	OK          bool
+	ClientId    int64
+	RequestId   int64
+	WrongLeader bool
+	Err         Err
+	// QueryReply
+	Config Config
+}
+
+func (sm *ShardMaster) getCurrentConfig() Config {
+	return sm.configs[len(sm.configs)-1]
 }
 
 //
-// try to append an entry to raft servers' log.
-// return true if raft servers apply this entry before timeout.
+// try to append the entry to raft servers' log and return result.
+// result is valid if raft servers apply this entry before timeout.
 //
-func (sm *ShardMaster) appendEntryToLog(entry Op) bool {
+func (sm *ShardMaster) appendEntryToLog(entry Op) Result {
 	index, _, isLeader := sm.rf.Start(entry)
 	if !isLeader {
-		return false
+		return Result{OK: false}
 	}
 
 	sm.mu.Lock()
-	if _, ok := sm.notify[index]; !ok {
-		sm.notify[index] = make(chan Op, 1)
+	if _, ok := sm.resultCh[index]; !ok {
+		sm.resultCh[index] = make(chan Result, 1)
 	}
 	sm.mu.Unlock()
 
 	select {
-	case appliedEntry := <-sm.notify[index]:
-		return isEqualEntry(entry, appliedEntry)
+	case result := <-sm.resultCh[index]:
+		if isMatch(entry, result) {
+			return result
+		}
+		return Result{OK: false}
 	case <-time.After(240 * time.Millisecond):
-		return false
+		return Result{OK: false}
 	}
 }
 
 //
-// check if two entries are equal(with same client id and request id).
+// check if the result corresponds to the log entry.
 //
-func isEqualEntry(entry1 Op, entry2 Op) bool {
-	return entry1.ClientId == entry2.ClientId && entry1.RequestId == entry2.RequestId
+func isMatch(entry Op, result Result) bool {
+	return entry.ClientId == result.ClientId && entry.RequestId == result.RequestId
 }
 
 func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
@@ -80,15 +102,15 @@ func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 	entry.Command = "join"
 	entry.ClientId = args.ClientId
 	entry.RequestId = args.RequestId
-	entry.Args = *args
+	entry.Servers = args.Servers
 
-	ok := sm.appendEntryToLog(entry)
-	if !ok {
+	result := sm.appendEntryToLog(entry)
+	if !result.OK {
 		reply.WrongLeader = true
 		return
 	}
 	reply.WrongLeader = false
-	reply.Err = OK
+	reply.Err = result.Err
 }
 
 func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
@@ -97,15 +119,15 @@ func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
 	entry.Command = "leave"
 	entry.ClientId = args.ClientId
 	entry.RequestId = args.RequestId
-	entry.Args = *args
+	entry.GIDs = args.GIDs
 
-	ok := sm.appendEntryToLog(entry)
-	if !ok {
+	result := sm.appendEntryToLog(entry)
+	if !result.OK {
 		reply.WrongLeader = true
 		return
 	}
 	reply.WrongLeader = false
-	reply.Err = OK
+	reply.Err = result.Err
 }
 
 func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
@@ -114,15 +136,16 @@ func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 	entry.Command = "move"
 	entry.ClientId = args.ClientId
 	entry.RequestId = args.RequestId
-	entry.Args = *args
+	entry.Shard = args.Shard
+	entry.GID = args.GID
 
-	ok := sm.appendEntryToLog(entry)
-	if !ok {
+	result := sm.appendEntryToLog(entry)
+	if !result.OK {
 		reply.WrongLeader = true
 		return
 	}
 	reply.WrongLeader = false
-	reply.Err = OK
+	reply.Err = result.Err
 }
 
 func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
@@ -131,47 +154,66 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 	entry.Command = "query"
 	entry.ClientId = args.ClientId
 	entry.RequestId = args.RequestId
-	entry.Args = *args
+	entry.Num = args.Num
 
-	ok := sm.appendEntryToLog(entry)
-	if !ok {
+	result := sm.appendEntryToLog(entry)
+	if !result.OK {
 		reply.WrongLeader = true
 		return
 	}
 	reply.WrongLeader = false
-	reply.Err = OK
-	sm.mu.Lock()
-	if args.Num == -1 || args.Num >= len(sm.configs) {
-		reply.Config = sm.configs[len(sm.configs)-1]
-	} else {
-		reply.Config = sm.configs[args.Num]
-	}
-	sm.mu.Unlock()
+	reply.Err = result.Err
+	reply.Config = result.Config
 }
 
 //
-// apply operation on configuration.
+// apply operation on configuration and return result.
 //
-func (sm *ShardMaster) applyOp(op Op) {
+func (sm *ShardMaster) applyOp(op Op) Result {
+	result := Result{}
+	result.Command = op.Command
+	result.OK = true
+	result.WrongLeader = false
+	result.ClientId = op.ClientId
+	result.RequestId = op.RequestId
+
 	switch op.Command {
 	case "join":
-		args := op.Args.(JoinArgs)
-		config := sm.makeNextConfig()
-		applyJoin(&config, args)
-		sm.configs = append(sm.configs, config)
+		if !sm.isDuplicated(op) {
+			sm.applyJoin(op)
+		}
+		result.Err = OK
 	case "leave":
-		args := op.Args.(LeaveArgs)
-		config := sm.makeNextConfig()
-		applyLeave(&config, args)
-		sm.configs = append(sm.configs, config)
+		if !sm.isDuplicated(op) {
+			sm.applyLeave(op)
+		}
+		result.Err = OK
 	case "move":
-		args := op.Args.(MoveArgs)
-		config := sm.makeNextConfig()
-		applyMove(&config, args)
-		sm.configs = append(sm.configs, config)
-	case "get":
+		if !sm.isDuplicated(op) {
+			sm.applyMove(op)
+		}
+		result.Err = OK
+	case "query":
+		if op.Num == -1 || op.Num >= len(sm.configs) {
+			result.Config = sm.configs[len(sm.configs)-1]
+		} else {
+			result.Config = sm.configs[op.Num]
+		}
+		result.Err = OK
 	}
 	sm.ack[op.ClientId] = op.RequestId
+	return result
+}
+
+//
+// check if the request is duplicated with request id.
+//
+func (sm *ShardMaster) isDuplicated(op Op) bool {
+	lastRequestId, ok := sm.ack[op.ClientId]
+	if ok {
+		return lastRequestId >= op.RequestId
+	}
+	return false
 }
 
 //
@@ -194,7 +236,8 @@ func (sm *ShardMaster) makeNextConfig() Config {
 //
 // apply join request to modify config.
 //
-func applyJoin(config *Config, args JoinArgs) {
+func (sm *ShardMaster) applyJoin(args Op) {
+	config := sm.makeNextConfig()
 	for gid, servers := range args.Servers {
 		config.Groups[gid] = servers
 
@@ -205,13 +248,15 @@ func applyJoin(config *Config, args JoinArgs) {
 			}
 		}
 	}
-	rebalanceShards(config)
+	rebalanceShards(&config)
+	sm.configs = append(sm.configs, config)
 }
 
 //
 // apply leave request to modify config.
 //
-func applyLeave(config *Config, args LeaveArgs) {
+func (sm *ShardMaster) applyLeave(args Op) {
+	config := sm.makeNextConfig()
 	// find a replica group won't leave.
 	stayGid := 0
 	for gid := range config.Groups {
@@ -236,14 +281,17 @@ func applyLeave(config *Config, args LeaveArgs) {
 		}
 		delete(config.Groups, gid)
 	}
-	rebalanceShards(config)
+	rebalanceShards(&config)
+	sm.configs = append(sm.configs, config)
 }
 
 //
 // apply move request to modify config.
 //
-func applyMove(config *Config, args MoveArgs) {
+func (sm *ShardMaster) applyMove(args Op) {
+	config := sm.makeNextConfig()
 	config.Shards[args.Shard] = args.GID
+	sm.configs = append(sm.configs, config)
 }
 
 //
@@ -326,36 +374,21 @@ func (sm *ShardMaster) Raft() *raft.Raft {
 func (sm *ShardMaster) Run() {
 	for {
 		msg := <-sm.applyCh
-		op := msg.Command.(Op)
-
 		sm.mu.Lock()
-		if !sm.isDuplicate(op) {
-			// apply operation if it is not duplicate request
-			sm.applyOp(op)
-		}
-
-		// send success notification (even for duplicate request)
-		if ch, ok := sm.notify[msg.CommandIndex]; ok {
+		// apply operation and send result
+		op := msg.Command.(Op)
+		result := sm.applyOp(op)
+		if ch, ok := sm.resultCh[msg.CommandIndex]; ok {
 			select {
 			case <-ch: // drain bad data
 			default:
 			}
 		} else {
-			sm.notify[msg.CommandIndex] = make(chan Op, 1)
+			sm.resultCh[msg.CommandIndex] = make(chan Result, 1)
 		}
-		sm.notify[msg.CommandIndex] <- op
+		sm.resultCh[msg.CommandIndex] <- result
 		sm.mu.Unlock()
 	}
-}
-
-//
-// check if the request is duplicated with request id.
-//
-func (sm *ShardMaster) isDuplicate(op Op) bool {
-	if latestRequestId, ok := sm.ack[op.ClientId]; ok {
-		return latestRequestId >= op.RequestId
-	}
-	return false
 }
 
 //
@@ -372,17 +405,14 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sm.configs[0].Groups = map[int][]string{}
 
 	labgob.Register(Op{})
+	labgob.Register(Result{})
+
 	sm.applyCh = make(chan raft.ApplyMsg, 100)
 	sm.rf = raft.Make(servers, me, persister, sm.applyCh)
 
 	// Your code here.
-	labgob.Register(JoinArgs{})
-	labgob.Register(LeaveArgs{})
-	labgob.Register(MoveArgs{})
-	labgob.Register(QueryArgs{})
-
 	sm.ack = make(map[int64]int64)
-	sm.notify = make(map[int]chan Op)
+	sm.resultCh = make(map[int]chan Result)
 
 	go sm.Run()
 	return sm
