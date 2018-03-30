@@ -312,9 +312,10 @@ func rebalanceShards(config *Config) {
 			// each time move a shard from replica group with most shards to replica
 			// gorup with fewest shards.
 			srcGid, dstGid := getGidPairToMove(gidToShards)
-			config.Shards[gidToShards[srcGid][0]] = dstGid
-			gidToShards[dstGid] = append(gidToShards[dstGid], gidToShards[srcGid][0])
-			gidToShards[srcGid] = gidToShards[srcGid][1:]
+			N := len(gidToShards[srcGid]) - 1
+			config.Shards[gidToShards[srcGid][N]] = dstGid
+			gidToShards[dstGid] = append(gidToShards[dstGid], gidToShards[srcGid][N])
+			gidToShards[srcGid] = gidToShards[srcGid][:N]
 		}
 	}
 }
