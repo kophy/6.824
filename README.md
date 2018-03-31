@@ -23,3 +23,5 @@ MIT 6.824: Distributed Systems Spring 2018
 ### Lab 4 Sharded Key/Value Service
 - [X] The Shard Master
 - [ ] Sharded Key/Value Server
+  - [ ] Garbage collection of state
+  - [ ] Client requests during configuration changes

@@ -24,12 +24,13 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Command   string
+	Command string
+	// Parameters for key-value service.
 	ClientId  int64
 	RequestId int64
 	Key       string
 	Value     string
-	// ReconfigureArgs
+	// Parameters for updating configuration.
 	Config shardmaster.Config
 	Data   [shardmaster.NShards]map[string]string
 	Ack    map[int64]int64
@@ -38,13 +39,14 @@ type Op struct {
 type Result struct {
 	Command     string
 	OK          bool
-	ClientId    int64
-	RequestId   int64
 	WrongLeader bool
 	Err         Err
-	Value       string
-	// ReconfigureReply
-	Num int
+	// Parameters for key-value service.
+	ClientId  int64
+	RequestId int64
+	Value     string
+	// Parameters for updating configuration.
+	ConfigNum int
 }
 
 type ShardKV struct {
@@ -97,7 +99,7 @@ func (kv *ShardKV) appendEntryToLog(entry Op) Result {
 //
 func isMatch(entry Op, result Result) bool {
 	if entry.Command == "reconfigure" {
-		return entry.Config.Num == result.Num
+		return entry.Config.Num == result.ConfigNum
 	}
 	return entry.ClientId == result.ClientId && entry.RequestId == result.RequestId
 }
@@ -169,7 +171,6 @@ func (kv *ShardKV) applyPut(args Op, result *Result) {
 		kv.ack[args.ClientId] = args.RequestId
 	}
 	result.Err = OK
-	// DPrintf("server %d put %s %s", kv.me, args.Key, args.Value)
 }
 
 func (kv *ShardKV) applyAppend(args Op, result *Result) {
@@ -182,7 +183,6 @@ func (kv *ShardKV) applyAppend(args Op, result *Result) {
 		kv.ack[args.ClientId] = args.RequestId
 	}
 	result.Err = OK
-	// DPrintf("server %d append %s %s", kv.me, args.Key, args.Value)
 }
 
 func (kv *ShardKV) applyGet(args Op, result *Result) {
@@ -199,11 +199,10 @@ func (kv *ShardKV) applyGet(args Op, result *Result) {
 	} else {
 		result.Err = ErrNoKey
 	}
-	// DPrintf("server %d get %s", kv.me, args.Key)
 }
 
 func (kv *ShardKV) applyReconfigure(args Op, result *Result) {
-	result.Num = args.Config.Num
+	result.ConfigNum = args.Config.Num
 	if args.Config.Num == kv.config.Num+1 {
 		for shardId, shardData := range args.Data {
 			for k, v := range shardData {
@@ -219,7 +218,6 @@ func (kv *ShardKV) applyReconfigure(args Op, result *Result) {
 		kv.config = args.Config
 	}
 	result.Err = OK
-	// cDPrintf("server %d update config %v", kv.me, args.Config)
 }
 
 //
@@ -293,6 +291,17 @@ func (kv *ShardKV) Run() {
 	}
 }
 
+type TransferShardArgs struct {
+	Num      int
+	ShardIds []int
+}
+
+type TransferShardReply struct {
+	Err  Err
+	Data [shardmaster.NShards]map[string]string
+	Ack  map[int64]int64
+}
+
 //
 // if this server is ready, copy shards required in args and ack to reply.
 //
@@ -341,67 +350,78 @@ func (kv *ShardKV) sendTransferShard(gid int, args *TransferShardArgs, reply *Tr
 	return true
 }
 
+type ReconfigureArgs struct {
+	Config shardmaster.Config
+	Data   [shardmaster.NShards]map[string]string
+	Ack    map[int64]int64
+}
+
 //
 // collect shards from other replica groups required for reconfiguration and build
-// reconfigure args to append in raft log.
+// reconfigure log entry to append to raft log.
 //
-func (kv *ShardKV) getReconfigureArgs(nextConfig shardmaster.Config) (ReconfigureArgs, bool) {
-	reconfigureArgs := ReconfigureArgs{}
-	reconfigureArgs.Config = nextConfig
+func (kv *ShardKV) getReconfigureEntry(nextConfig shardmaster.Config) (Op, bool) {
+	entry := Op{}
+	entry.Command = "reconfigure"
+	entry.Config = nextConfig
 	for i := 0; i < shardmaster.NShards; i++ {
-		reconfigureArgs.Data[i] = make(map[string]string)
+		entry.Data[i] = make(map[string]string)
 	}
-	reconfigureArgs.Ack = make(map[int64]int64)
+	entry.Ack = make(map[int64]int64)
 	ok := true
 
-	transShards := make(map[int][]int)
-	for i := 0; i < shardmaster.NShards; i++ {
-		if kv.config.Shards[i] != kv.gid && nextConfig.Shards[i] == kv.gid {
-			gid := kv.config.Shards[i]
-			if gid != 0 {
-				if _, ok := transShards[gid]; !ok {
-					transShards[gid] = make([]int, 0)
-				}
-				transShards[gid] = append(transShards[gid], i)
-			}
-		}
-	}
-
-	var ackMutex sync.Mutex
+	var ackMu sync.Mutex
 	var wg sync.WaitGroup
-	for gid, value := range transShards {
+
+	transferShards := kv.getShardsToTransfer(nextConfig)
+	for gid, shardIds := range transferShards {
 		wg.Add(1)
-		args := TransferShardArgs{}
-		args.Num = nextConfig.Num
-		args.ShardIds = value
 
 		go func(gid int, args TransferShardArgs, reply TransferShardReply) {
 			defer wg.Done()
 
 			if kv.sendTransferShard(gid, &args, &reply) {
-				ackMutex.Lock()
-
+				ackMu.Lock()
 				// copy only shards requested from that replica group to reconfigure args
 				for _, shardId := range args.ShardIds {
 					shardData := reply.Data[shardId]
 					for k, v := range shardData {
-						reconfigureArgs.Data[shardId][k] = v
+						entry.Data[shardId][k] = v
 					}
 				}
 				// merge ack map from that replica group to reconfigure args
 				for clientId := range reply.Ack {
-					if _, ok := reconfigureArgs.Ack[clientId]; !ok || reconfigureArgs.Ack[clientId] < reply.Ack[clientId] {
-						reconfigureArgs.Ack[clientId] = reply.Ack[clientId]
+					if _, ok := entry.Ack[clientId]; !ok || entry.Ack[clientId] < reply.Ack[clientId] {
+						entry.Ack[clientId] = reply.Ack[clientId]
 					}
 				}
-				ackMutex.Unlock()
+				ackMu.Unlock()
 			} else {
 				ok = false
 			}
-		}(gid, args, TransferShardReply{})
+		}(gid, TransferShardArgs{Num: nextConfig.Num, ShardIds: shardIds}, TransferShardReply{})
 	}
 	wg.Wait()
-	return reconfigureArgs, ok
+	return entry, ok
+}
+
+//
+// build a map from gid to shard ids to request from replica group specified by gid.
+//
+func (kv *ShardKV) getShardsToTransfer(nextConfig shardmaster.Config) map[int][]int {
+	transferShards := make(map[int][]int)
+	for i := 0; i < shardmaster.NShards; i++ {
+		if kv.config.Shards[i] != kv.gid && nextConfig.Shards[i] == kv.gid {
+			gid := kv.config.Shards[i]
+			if gid != 0 {
+				if _, ok := transferShards[gid]; !ok {
+					transferShards[gid] = make([]int, 0)
+				}
+				transferShards[gid] = append(transferShards[gid], i)
+			}
+		}
+	}
+	return transferShards
 }
 
 //
@@ -411,33 +431,22 @@ func (kv *ShardKV) getReconfigureArgs(nextConfig shardmaster.Config) (Reconfigur
 func (kv *ShardKV) Reconfigure() {
 	for {
 		if _, isLeader := kv.rf.GetState(); isLeader {
-			currConfig := kv.mck.Query(-1)
-			for i := kv.config.Num + 1; i <= currConfig.Num; i++ {
+			latestConfig := kv.mck.Query(-1)
+			for i := kv.config.Num + 1; i <= latestConfig.Num; i++ {
 				// apply configuration changes in order
-				config := kv.mck.Query(i)
-				args, ok := kv.getReconfigureArgs(config)
-				if !ok || !kv.updateConfigure(args) {
+				nextConfig := kv.mck.Query(i)
+				entry, ok := kv.getReconfigureEntry(nextConfig)
+				if !ok {
+					break
+				}
+				result := kv.appendEntryToLog(entry)
+				if !result.OK {
 					break
 				}
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-}
-
-//
-// configuration update is done through appending entry to raft log, just like
-// put/append/get call from client.
-//
-func (kv *ShardKV) updateConfigure(args ReconfigureArgs) bool {
-	entry := Op{}
-	entry.Command = "reconfigure"
-	entry.Config = args.Config
-	entry.Data = args.Data
-	entry.Ack = args.Ack
-
-	result := kv.appendEntryToLog(entry)
-	return result.OK
 }
 
 //
