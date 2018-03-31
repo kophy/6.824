@@ -556,9 +556,9 @@ func TestUnreliable3(t *testing.T) {
 	cfg := make_config(t, 3, true, 100)
 	defer cfg.cleanup()
 
-    begin := time.Now()
-    var operations []linearizability.Operation
-    var opMu sync.Mutex
+	begin := time.Now()
+	var operations []linearizability.Operation
+	var opMu sync.Mutex
 
 	ck := cfg.makeClient()
 
@@ -570,7 +570,13 @@ func TestUnreliable3(t *testing.T) {
 	for i := 0; i < n; i++ {
 		ka[i] = strconv.Itoa(i) // ensure multiple shards
 		va[i] = randstring(5)
+		start := int64(time.Since(begin))
 		ck.Put(ka[i], va[i])
+		end := int64(time.Since(begin))
+		inp := linearizability.KvInput{Op: 1, Key: ka[i], Value: va[i]}
+		var out linearizability.KvOutput
+		op := linearizability.Operation{Input: inp, Call: start, Output: out, Return: end}
+		operations = append(operations, op)
 	}
 
 	var done int32
@@ -580,27 +586,27 @@ func TestUnreliable3(t *testing.T) {
 		defer func() { ch <- true }()
 		ck1 := cfg.makeClient()
 		for atomic.LoadInt32(&done) == 0 {
-            ki := rand.Int() % n
-            nv := randstring(5)
-            var inp linearizability.KvInput
-            var out linearizability.KvOutput
-            start := int64(time.Since(begin))
-            if (rand.Int() % 1000) < 500 {
-                ck1.Append(ka[ki], nv)
-                inp = linearizability.KvInput{Op: 2, Key: ka[ki], Value: nv}
-            } else if (rand.Int() % 1000) < 100 {
-                ck1.Put(ka[ki], nv)
-                inp = linearizability.KvInput{Op: 1, Key: ka[ki], Value: nv}
-            } else {
-                v := ck1.Get(ka[ki])
-                inp = linearizability.KvInput{Op: 0, Key: ka[ki]}
-                out = linearizability.KvOutput{Value: v}
-            }
-            end := int64(time.Since(begin))
-            op := linearizability.Operation{Input: inp, Call: start, Output: out, Return: end}
-            opMu.Lock()
-            operations = append(operations, op)
-            opMu.Unlock()
+			ki := rand.Int() % n
+			nv := randstring(5)
+			var inp linearizability.KvInput
+			var out linearizability.KvOutput
+			start := int64(time.Since(begin))
+			if (rand.Int() % 1000) < 500 {
+				ck1.Append(ka[ki], nv)
+				inp = linearizability.KvInput{Op: 2, Key: ka[ki], Value: nv}
+			} else if (rand.Int() % 1000) < 100 {
+				ck1.Put(ka[ki], nv)
+				inp = linearizability.KvInput{Op: 1, Key: ka[ki], Value: nv}
+			} else {
+				v := ck1.Get(ka[ki])
+				inp = linearizability.KvInput{Op: 0, Key: ka[ki]}
+				out = linearizability.KvOutput{Value: v}
+			}
+			end := int64(time.Since(begin))
+			op := linearizability.Operation{Input: inp, Call: start, Output: out, Return: end}
+			opMu.Lock()
+			operations = append(operations, op)
+			opMu.Unlock()
 		}
 	}
 
