@@ -1,18 +1,50 @@
 package shardkv
 
+import (
+	"bytes"
+	"labgob"
+	"labrpc"
+	"log"
+	"raft"
+	"shardmaster"
+	"sync"
+	"time"
+)
 
-// import "shardmaster"
-import "labrpc"
-import "raft"
-import "sync"
-import "labgob"
+const Debug = 1
 
-
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug > 0 {
+		log.Printf(format, a...)
+	}
+	return
+}
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Command   string
+	ClientId  int64
+	RequestId int64
+	Key       string
+	Value     string
+	// ReconfigureArgs
+	Config shardmaster.Config
+	Data   [shardmaster.NShards]map[string]string
+	Ack    map[int64]int64
+}
+
+type Result struct {
+	Command     string
+	OK          bool
+	ClientId    int64
+	RequestId   int64
+	WrongLeader bool
+	Err         Err
+	Value       string
+	// ReconfigureReply
+	Num int
 }
 
 type ShardKV struct {
@@ -26,15 +58,221 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	data     [shardmaster.NShards]map[string]string
+	ack      map[int64]int64
+	resultCh map[int]chan Result
+
+	config shardmaster.Config
+	mck    *shardmaster.Clerk
 }
 
+//
+// try to append the entry to raft servers' log and return result.
+// result is valid if raft servers apply this entry before timeout.
+//
+func (kv *ShardKV) appendEntryToLog(entry Op) Result {
+	index, _, isLeader := kv.rf.Start(entry)
+	if !isLeader {
+		return Result{OK: false}
+	}
+
+	kv.mu.Lock()
+	if _, ok := kv.resultCh[index]; !ok {
+		kv.resultCh[index] = make(chan Result, 1)
+	}
+	kv.mu.Unlock()
+
+	select {
+	case result := <-kv.resultCh[index]:
+		if isMatch(entry, result) {
+			return result
+		}
+		return Result{OK: false}
+	case <-time.After(240 * time.Millisecond):
+		return Result{OK: false}
+	}
+}
+
+//
+// check if the result corresponds to the log entry.
+//
+func isMatch(entry Op, result Result) bool {
+	if entry.Command == "reconfigure" {
+		return entry.Config.Num == result.Num
+	}
+	return entry.ClientId == result.ClientId && entry.RequestId == result.RequestId
+}
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	entry := Op{}
+	entry.Command = "get"
+	entry.ClientId = args.ClientId
+	entry.RequestId = args.RequestId
+	entry.Key = args.Key
+
+	result := kv.appendEntryToLog(entry)
+	if !result.OK {
+		reply.WrongLeader = true
+		return
+	}
+	reply.WrongLeader = false
+	reply.Err = result.Err
+	reply.Value = result.Value
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	entry := Op{}
+	entry.Command = args.Op
+	entry.ClientId = args.ClientId
+	entry.RequestId = args.RequestId
+	entry.Key = args.Key
+	entry.Value = args.Value
+
+	result := kv.appendEntryToLog(entry)
+	if !result.OK {
+		reply.WrongLeader = true
+		return
+	}
+	reply.WrongLeader = false
+	reply.Err = result.Err
+}
+
+func (kv *ShardKV) applyOp(op Op) Result {
+	result := Result{}
+	result.Command = op.Command
+	result.OK = true
+	result.WrongLeader = false
+	result.ClientId = op.ClientId
+	result.RequestId = op.RequestId
+
+	switch op.Command {
+	case "put":
+		kv.applyPut(op, &result)
+	case "append":
+		kv.applyAppend(op, &result)
+	case "get":
+		kv.applyGet(op, &result)
+	case "reconfigure":
+		kv.applyReconfigure(op, &result)
+	}
+	return result
+}
+
+func (kv *ShardKV) applyPut(args Op, result *Result) {
+	if !kv.isValidKey(args.Key) {
+		result.Err = ErrWrongGroup
+		return
+	}
+	if !kv.isDuplicated(args) {
+		kv.data[key2shard(args.Key)][args.Key] = args.Value
+		kv.ack[args.ClientId] = args.RequestId
+	}
+	result.Err = OK
+}
+
+func (kv *ShardKV) applyAppend(args Op, result *Result) {
+	if !kv.isValidKey(args.Key) {
+		result.Err = ErrWrongGroup
+		return
+	}
+	if !kv.isDuplicated(args) {
+		kv.data[key2shard(args.Key)][args.Key] += args.Value
+		kv.ack[args.ClientId] = args.RequestId
+	}
+	result.Err = OK
+}
+
+func (kv *ShardKV) applyGet(args Op, result *Result) {
+	if !kv.isValidKey(args.Key) {
+		result.Err = ErrWrongGroup
+		return
+	}
+	if !kv.isDuplicated(args) {
+		kv.ack[args.ClientId] = args.RequestId
+	}
+	if value, ok := kv.data[key2shard(args.Key)][args.Key]; ok {
+		result.Value = value
+		result.Err = OK
+	} else {
+		result.Err = ErrNoKey
+	}
+}
+
+func (kv *ShardKV) applyReconfigure(args Op, result *Result) {
+	result.Num = args.Config.Num
+	if args.Config.Num > kv.config.Num {
+		for shardIndex, shardData := range args.Data {
+			for k, v := range shardData {
+				kv.data[shardIndex][k] = v
+			}
+		}
+		for clientId := range args.Ack {
+			if _, ok := kv.ack[clientId]; !ok || kv.ack[clientId] < args.Ack[clientId] {
+				kv.ack[clientId] = args.Ack[clientId]
+			}
+		}
+		kv.config = args.Config
+	}
+	result.Err = OK
+}
+
+//
+// check if the request is duplicated with request id.
+//
+func (kv *ShardKV) isDuplicated(op Op) bool {
+	lastRequestId, ok := kv.ack[op.ClientId]
+	if ok {
+		return lastRequestId >= op.RequestId
+	}
+	return false
+}
+
+//
+// check if the key is handled by this replica group.
+//
+func (kv *ShardKV) isValidKey(key string) bool {
+	return kv.config.Shards[key2shard(key)] == kv.gid
+}
+
+func (kv *ShardKV) MoveShard(args *MoveShardArgs, reply *MoveShardReply) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	if kv.config.Num < args.Num {
+		reply.Err = ErrNotReady
+		return
+	}
+	for i := 0; i < shardmaster.NShards; i++ {
+		reply.Data[i] = make(map[string]string)
+	}
+	for _, shardId := range args.ShardIds {
+		for k, v := range kv.data[shardId] {
+			reply.Data[shardId][k] = v
+		}
+	}
+	reply.Ack = make(map[int64]int64)
+	for clientId, requestId := range kv.ack {
+		reply.Ack[clientId] = requestId
+	}
+	reply.Err = OK
+}
+
+func (kv *ShardKV) sendMoveShard(gid int, args *MoveShardArgs, reply *MoveShardReply) bool {
+	for _, server := range kv.config.Groups[gid] {
+		srv := kv.make_end(server)
+		ok := srv.Call("ShardKV.MoveShard", args, reply)
+		if ok {
+			if reply.Err == OK {
+				return true
+			}
+			if reply.Err == ErrNotReady {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 //
@@ -48,6 +286,131 @@ func (kv *ShardKV) Kill() {
 	// Your code here, if desired.
 }
 
+func (kv *ShardKV) Run() {
+	for {
+		msg := <-kv.applyCh
+		kv.mu.Lock()
+		if msg.UseSnapshot {
+			r := bytes.NewBuffer(msg.Snapshot)
+			d := labgob.NewDecoder(r)
+
+			var lastIncludedIndex, lastIncludedTerm int
+			d.Decode(&lastIncludedIndex)
+			d.Decode(&lastIncludedTerm)
+			d.Decode(&kv.data)
+			d.Decode(&kv.ack)
+			d.Decode(&kv.config)
+		} else {
+			// apply operation and send result
+			op := msg.Command.(Op)
+			result := kv.applyOp(op)
+			if ch, ok := kv.resultCh[msg.CommandIndex]; ok {
+				select {
+				case <-ch: // drain bad data
+				default:
+				}
+			} else {
+				kv.resultCh[msg.CommandIndex] = make(chan Result, 1)
+			}
+			kv.resultCh[msg.CommandIndex] <- result
+
+			// create snapshot if raft state exceeds allowed size
+			if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() > kv.maxraftstate {
+				w := new(bytes.Buffer)
+				e := labgob.NewEncoder(w)
+				e.Encode(kv.data)
+				e.Encode(kv.ack)
+				e.Encode(kv.config)
+				go kv.rf.CreateSnapshot(w.Bytes(), msg.CommandIndex)
+			}
+		}
+		kv.mu.Unlock()
+	}
+}
+
+func (kv *ShardKV) getReconfigureArgs(nextConfig shardmaster.Config) (ReconfigureArgs, bool) {
+	retArgs := ReconfigureArgs{}
+	retArgs.Config = nextConfig
+	retArgs.Ack = make(map[int64]int64)
+	for i := 0; i < shardmaster.NShards; i++ {
+		retArgs.Data[i] = make(map[string]string)
+	}
+	retOk := true
+
+	transShards := make(map[int][]int)
+	for i := 0; i < shardmaster.NShards; i++ {
+		if kv.config.Shards[i] != kv.gid && nextConfig.Shards[i] == kv.gid {
+			gid := kv.config.Shards[i]
+			if gid != 0 {
+				if _, ok := transShards[gid]; !ok {
+					transShards[gid] = []int{i}
+				} else {
+					transShards[gid] = append(transShards[gid], i)
+				}
+			}
+		}
+	}
+
+	var ackMutex sync.Mutex
+	var wait sync.WaitGroup
+	for gid, value := range transShards {
+		wait.Add(1)
+		go func(gid int, value []int) {
+			defer wait.Done()
+
+			args := MoveShardArgs{}
+			args.Num = nextConfig.Num
+			args.ShardIds = value
+			reply := MoveShardReply{}
+
+			if kv.sendMoveShard(gid, &args, &reply) {
+				ackMutex.Lock()
+				for shardIndex, shardData := range reply.Data {
+					for k, v := range shardData {
+						retArgs.Data[shardIndex][k] = v
+					}
+				}
+				for clientId := range reply.Ack {
+					if _, ok := retArgs.Ack[clientId]; !ok || retArgs.Ack[clientId] < reply.Ack[clientId] {
+						retArgs.Ack[clientId] = reply.Ack[clientId]
+					}
+				}
+				ackMutex.Unlock()
+			} else {
+				retOk = false
+			}
+		}(gid, value)
+	}
+	wait.Wait()
+	return retArgs, retOk
+}
+
+func (kv *ShardKV) updateConfigure(args ReconfigureArgs) bool {
+	entry := Op{}
+	entry.Command = "reconfigure"
+	entry.Config = args.Config
+	entry.Data = args.Data
+	entry.Ack = args.Ack
+
+	result := kv.appendEntryToLog(entry)
+	return result.OK
+}
+
+func (kv *ShardKV) Reconfigure() {
+	for {
+		if _, isLeader := kv.rf.GetState(); isLeader {
+			currConfig := kv.mck.Query(-1)
+			for i := kv.config.Num + 1; i <= currConfig.Num; i++ {
+				config := kv.mck.Query(i)
+				args, ok := kv.getReconfigureArgs(config)
+				if !ok || !kv.updateConfigure(args) {
+					break
+				}
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
 
 //
 // servers[] contains the ports of the servers in this group.
@@ -81,6 +444,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
+	labgob.Register(Result{})
+	labgob.Register(shardmaster.Config{})
 
 	kv := new(ShardKV)
 	kv.me = me
@@ -97,6 +462,15 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
+	for i := 0; i < shardmaster.NShards; i++ {
+		kv.data[i] = make(map[string]string)
+	}
+	kv.ack = make(map[int64]int64)
+	kv.resultCh = make(map[int]chan Result)
+	kv.mck = shardmaster.MakeClerk(masters)
+
+	go kv.Run()
+	go kv.Reconfigure()
 
 	return kv
 }
