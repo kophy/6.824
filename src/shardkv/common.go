@@ -62,13 +62,13 @@ type ReconfigureReply struct {
 	Num int
 }
 
-type MoveShardArgs struct {
+type TransferShardArgs struct {
 	Num      int
 	ShardIds []int
 }
 
-type MoveShardReply struct {
-	Err  Err
-	Data [shardmaster.NShards]map[string]string
-	Ack  map[int64]int64
+type TransferShardReply struct {
+	Err         Err
+	Data        [shardmaster.NShards]map[string]string
+	Ack         map[int64]int64
 }
