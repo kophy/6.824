@@ -7,7 +7,6 @@ import (
 	"log"
 	"raft"
 	"shardmaster"
-	"strconv"
 	"sync"
 	"time"
 )
@@ -35,9 +34,6 @@ type Op struct {
 	Config shardmaster.Config
 	Data   [shardmaster.NShards]map[string]string
 	Ack    map[int64]int64
-	// Parameters for cleaning up shards.
-	ConfigNum int
-	ShardId  int
 }
 
 type Result struct {
@@ -161,8 +157,6 @@ func (kv *ShardKV) applyOp(op Op) Result {
 		kv.applyGet(op, &result)
 	case "reconfigure":
 		kv.applyReconfigure(op, &result)
-	case "cleanup":
-		kv.applyCleanup(op, &result)
 	}
 	return result
 }
@@ -221,30 +215,9 @@ func (kv *ShardKV) applyReconfigure(args Op, result *Result) {
 				kv.ack[clientId] = args.Ack[clientId]
 			}
 		}
-
-		lastConfig := kv.config
 		kv.config = args.Config
-
-		for shardId, shardData := range args.Data {
-			if len(shardData) > 0 {
-				gid := lastConfig.Shards[shardId]
-				args := CleanupShardArgs{}
-				args.Num = lastConfig.Num
-				args.ShardId = shardId
-				go kv.sendCleanupShard(gid, &lastConfig, &args, &CleanupShardReply{})
-			}
-		}
-		// kv.PrintShards()
 	}
 	result.Err = OK
-}
-
-func (kv *ShardKV) applyCleanup(args Op, result *Result) {
-	if args.ConfigNum <= kv.config.Num {
-		if kv.gid != kv.config.Shards[args.ShardId] {
-			kv.data[args.ShardId] = make(map[string]string)
-		}
-	}
 }
 
 //
@@ -476,54 +449,6 @@ func (kv *ShardKV) Reconfigure() {
 	}
 }
 
-type CleanupShardArgs struct {
-	Num     int
-	ShardId int
-}
-
-type CleanupShardReply struct {
-	WrongLeader bool
-	Err         Err
-}
-
-func (kv *ShardKV) CleanupShard(args *CleanupShardArgs, reply *CleanupShardReply) {
-	if _, isLeader := kv.rf.GetState(); !isLeader {
-		reply.WrongLeader = true
-		return
-	}
-
-	if args.Num > kv.config.Num {
-		reply.WrongLeader = false
-		reply.Err = ErrNotReady
-		return
-	}
-
-	entry := Op{}
-	entry.Command = "cleanup"
-	entry.ConfigNum = args.Num
-	entry.ShardId = args.ShardId
-	kv.appendEntryToLog(entry)
-
-	reply.WrongLeader = false
-	reply.Err = OK
-}
-
-func (kv *ShardKV) sendCleanupShard(gid int, lastConfig *shardmaster.Config, args *CleanupShardArgs, reply *CleanupShardReply) bool {
-	for _, server := range lastConfig.Groups[gid] {
-		srv := kv.make_end(server)
-		ok := srv.Call("ShardKV.CleanupShard", args, reply)
-		if ok {
-			if reply.Err == OK {
-				return true
-			}
-			if reply.Err == ErrNotReady {
-				return false
-			}
-		}
-	}
-	return false
-}
-
 //
 // servers[] contains the ports of the servers in this group.
 //
@@ -584,14 +509,4 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	go kv.Reconfigure()
 
 	return kv
-}
-
-func (kv *ShardKV) PrintShards() {
-	message := ""
-	for i := range kv.data {
-		if len(kv.data[i]) > 0 {
-			message += strconv.Itoa(i) + " (" + strconv.Itoa(len(kv.data[i])) + ") "
-		}
-	}
-	DPrintf("server %d with configure %d, has shards %s", kv.me, kv.config.Num, message)
 }
