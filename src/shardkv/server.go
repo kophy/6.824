@@ -7,7 +7,6 @@ import (
 	"log"
 	"raft"
 	"shardmaster"
-	"strconv"
 	"sync"
 	"time"
 )
@@ -37,7 +36,7 @@ type Op struct {
 	Ack    map[int64]int64
 	// Parameters for cleaning up shards.
 	ConfigNum int
-	ShardId  int
+	ShardId   int
 }
 
 type Result struct {
@@ -105,6 +104,9 @@ func isMatch(entry Op, result Result) bool {
 	if entry.Command == "reconfigure" {
 		return entry.Config.Num == result.ConfigNum
 	}
+	if entry.Command == "delete" {
+		return entry.ConfigNum == result.ConfigNum
+	}
 	return entry.ClientId == result.ClientId && entry.RequestId == result.RequestId
 }
 
@@ -161,7 +163,7 @@ func (kv *ShardKV) applyOp(op Op) Result {
 		kv.applyGet(op, &result)
 	case "reconfigure":
 		kv.applyReconfigure(op, &result)
-	case "cleanup":
+	case "delete":
 		kv.applyCleanup(op, &result)
 	}
 	return result
@@ -225,16 +227,16 @@ func (kv *ShardKV) applyReconfigure(args Op, result *Result) {
 		lastConfig := kv.config
 		kv.config = args.Config
 
+		// ask other replica groups to delete shards no longer required.
 		for shardId, shardData := range args.Data {
 			if len(shardData) > 0 {
 				gid := lastConfig.Shards[shardId]
-				args := CleanupShardArgs{}
+				args := DeleteShardArgs{}
 				args.Num = lastConfig.Num
 				args.ShardId = shardId
-				go kv.sendCleanupShard(gid, &lastConfig, &args, &CleanupShardReply{})
+				go kv.sendDeleteShard(gid, &lastConfig, &args, &DeleteShardReply{})
 			}
 		}
-		// kv.PrintShards()
 	}
 	result.Err = OK
 }
@@ -476,17 +478,21 @@ func (kv *ShardKV) Reconfigure() {
 	}
 }
 
-type CleanupShardArgs struct {
+type DeleteShardArgs struct {
 	Num     int
 	ShardId int
 }
 
-type CleanupShardReply struct {
+type DeleteShardReply struct {
 	WrongLeader bool
 	Err         Err
 }
 
-func (kv *ShardKV) CleanupShard(args *CleanupShardArgs, reply *CleanupShardReply) {
+//
+// if this server is ready, create an entry to delete the shard in args and try
+// to append it to raft servers' log.
+//
+func (kv *ShardKV) DeleteShard(args *DeleteShardArgs, reply *DeleteShardReply) {
 	if _, isLeader := kv.rf.GetState(); !isLeader {
 		reply.WrongLeader = true
 		return
@@ -499,7 +505,7 @@ func (kv *ShardKV) CleanupShard(args *CleanupShardArgs, reply *CleanupShardReply
 	}
 
 	entry := Op{}
-	entry.Command = "cleanup"
+	entry.Command = "delete"
 	entry.ConfigNum = args.Num
 	entry.ShardId = args.ShardId
 	kv.appendEntryToLog(entry)
@@ -508,10 +514,14 @@ func (kv *ShardKV) CleanupShard(args *CleanupShardArgs, reply *CleanupShardReply
 	reply.Err = OK
 }
 
-func (kv *ShardKV) sendCleanupShard(gid int, lastConfig *shardmaster.Config, args *CleanupShardArgs, reply *CleanupShardReply) bool {
+//
+// try to ask replica group specified by gid in last config to delete the shard
+// no longer required.
+//
+func (kv *ShardKV) sendDeleteShard(gid int, lastConfig *shardmaster.Config, args *DeleteShardArgs, reply *DeleteShardReply) bool {
 	for _, server := range lastConfig.Groups[gid] {
 		srv := kv.make_end(server)
-		ok := srv.Call("ShardKV.CleanupShard", args, reply)
+		ok := srv.Call("ShardKV.DeleteShard", args, reply)
 		if ok {
 			if reply.Err == OK {
 				return true
@@ -521,7 +531,7 @@ func (kv *ShardKV) sendCleanupShard(gid int, lastConfig *shardmaster.Config, arg
 			}
 		}
 	}
-	return false
+	return true
 }
 
 //
@@ -584,14 +594,4 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	go kv.Reconfigure()
 
 	return kv
-}
-
-func (kv *ShardKV) PrintShards() {
-	message := ""
-	for i := range kv.data {
-		if len(kv.data[i]) > 0 {
-			message += strconv.Itoa(i) + " (" + strconv.Itoa(len(kv.data[i])) + ") "
-		}
-	}
-	DPrintf("server %d with configure %d, has shards %s", kv.me, kv.config.Num, message)
 }
