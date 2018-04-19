@@ -1,8 +1,6 @@
 # MIT-6.824
 
-MIT 6.824: Distributed Systems Spring 2018
-
-## TODO
+Labs of MIT 6.824: Distributed Systems.
 
 ### Lab 1 MapReduce
 - [X] MapReduce input and output
