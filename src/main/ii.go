@@ -1,11 +1,13 @@
 package main
 
-import "os"
-import "fmt"
-import "mapreduce"
-import "strconv"
-import "strings"
-import "unicode"
+import (
+	"fmt"
+	"mapreduce"
+	"os"
+	"strconv"
+	"strings"
+	"unicode"
+)
 
 // The mapping function is called once for each piece of the input.
 // In this framework, the key is the name of the file that is being processed,
@@ -19,8 +21,7 @@ func mapF(document string, value string) (res []mapreduce.KeyValue) {
 	seen := make(map[string]bool)
 	kv := make([]mapreduce.KeyValue, 0)
 	for _, word := range words {
-		_, ok := seen[word]
-		if !ok {
+		if _, ok := seen[word]; !ok {
 			seen[word] = true
 			kv = append(kv, mapreduce.KeyValue{word, document})
 		}

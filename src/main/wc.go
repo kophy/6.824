@@ -22,7 +22,6 @@ func mapF(filename string, contents string) []mapreduce.KeyValue {
 		return !unicode.IsLetter(r);
 	})
 	kv := make([]mapreduce.KeyValue, 0)
-
 	for _, word := range words {
 		kv = append(kv, mapreduce.KeyValue{word, "1"})
 	}
