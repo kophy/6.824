@@ -80,16 +80,16 @@ type Raft struct {
 	state     int
 	voteCount int
 
-	// Persistent state on all servers.
+	// State for persist: Updated on stable storage before responding to RPCs.
 	currentTerm int
 	votedFor    int
 	log         []LogEntry
 
-	// Volatile state on all servers.
+	// State for all: Volatile state on all servers.
 	commitIndex int
 	lastApplied int
 
-	// Volatile state on leaders.
+	// State for leader: Volatile state on leaders.
 	nextIndex  []int
 	matchIndex []int
 
@@ -132,7 +132,7 @@ func (rf *Raft) persist() {
 }
 
 //
-// restore previously persisted state.
+// reload previously persisted state.
 //
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
@@ -245,6 +245,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.persist()
 
 	if args.Term < rf.currentTerm {
+		// RequestVote Rule 1: Reply false if term < currentTerm
+		// RequestVote Result：reply.Term means currentTerm, for candidate to update itself
 		// reject request with stale term number
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
@@ -252,6 +254,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	if args.Term > rf.currentTerm {
+		// Rules for all: If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower	
 		// become follower and update current term
 		rf.state = STATE_FOLLOWER
 		rf.currentTerm = args.Term
@@ -261,6 +264,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 
+	// RequestVote Rule 2: If votedFor is null or candidateId, and candidate’s log is at least as up-to-date as receiver’s log, grant vote
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && rf.isUpToDate(args.LastLogTerm, args.LastLogIndex) {
 		// vote for the candidate
 		rf.votedFor = args.CandidateId
@@ -274,6 +278,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 func (rf *Raft) isUpToDate(candidateTerm int, candidateIndex int) bool {
 	term, index := rf.getLastLogTerm(), rf.getLastLogIndex()
+	// if canidate's term is bigger than receivers' 
+	// or they are at same term but candidate has bigger index 
+	// that means up-to-date
 	return candidateTerm > term || (candidateTerm == term && candidateIndex >= index)
 }
 
@@ -310,6 +317,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	// State: Updated on stable storage before responding to RPCs
 	defer rf.persist()
 
 	if ok {
@@ -318,6 +326,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 			return ok
 		}
 		if rf.currentTerm < reply.Term {
+			// Rules for all: If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
 			// revert to follower state and update current term
 			rf.state = STATE_FOLLOWER
 			rf.currentTerm = reply.Term
@@ -327,10 +336,12 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 		if reply.VoteGranted {
 			rf.voteCount++
+			// Rules for candidate: If votes received from majority of servers: become leader
 			if rf.voteCount > len(rf.peers)/2 {
 				// win the election
 				rf.state = STATE_LEADER
 				rf.persist()
+				// following two fields only initialize when server become leader 
 				rf.nextIndex = make([]int, len(rf.peers))
 				rf.matchIndex = make([]int, len(rf.peers))
 				nextIndex := rf.getLastLogIndex() + 1
@@ -355,6 +366,7 @@ func (rf *Raft) broadcastRequestVote() {
 	rf.mu.Unlock()
 
 	for server := range rf.peers {
+		// RequestVote: only invoked by candidates to gather vote
 		if server != rf.me && rf.state == STATE_CANDIDATE {
 			go rf.sendRequestVote(server, args, &RequestVoteReply{})
 		}
@@ -384,6 +396,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = false
 
 	if args.Term < rf.currentTerm {
+		// AppendEntries Rule 1: Reply false if term < currentTerm
 		// reject requests with stale term number
 		reply.Term = rf.currentTerm
 		reply.NextTryIndex = rf.getLastLogIndex() + 1
@@ -391,6 +404,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	if args.Term > rf.currentTerm {
+		// Rules for all: If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
 		// become follower and update current term
 		rf.state = STATE_FOLLOWER
 		rf.currentTerm = args.Term
@@ -403,6 +417,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 
 	if args.PrevLogIndex > rf.getLastLogIndex() {
+		// follower need to catch up leader
 		reply.NextTryIndex = rf.getLastLogIndex() + 1
 		return
 	}
@@ -410,6 +425,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	baseIndex := rf.log[0].Index
 
 	if args.PrevLogIndex >= baseIndex && args.PrevLogTerm != rf.log[args.PrevLogIndex-baseIndex].Term {
+		// AppendEntries Rule 3: If an existing entry conflicts with a new one (same index but different terms),
+		// delete the existing entry and all that follow it 
 		// if entry log[prevLogIndex] conflicts with new one, there may be conflict entries before.
 		// bypass all entries during the problematic term to speed up.
 		term := rf.log[args.PrevLogIndex-baseIndex].Term
@@ -429,6 +446,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.NextTryIndex = args.PrevLogIndex + len(args.Entries)
 
 		if rf.commitIndex < args.LeaderCommit {
+			// AppendEntries Rule 5: If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 			// update commitIndex and apply log
 			rf.commitIndex = min(args.LeaderCommit, rf.getLastLogIndex())
 			go rf.applyLog()
@@ -465,6 +483,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		return ok
 	}
 	if reply.Term > rf.currentTerm {
+		// Rules for all server: If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
 		// become follower and update current term
 		rf.currentTerm = reply.Term
 		rf.state = STATE_FOLLOWER
@@ -474,16 +493,21 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	}
 
 	if reply.Success {
+		// Rules for leader: If successful: update nextIndex and matchIndex for follower
 		if len(args.Entries) > 0 {
 			rf.nextIndex[server] = args.Entries[len(args.Entries)-1].Index + 1
 			rf.matchIndex[server] = rf.nextIndex[server] - 1
 		}
 	} else {
+		// Rules for leaeder:If AppendEntries fails because of log inconsistency: decrement nextIndex and retry
+		// Here use NextTryIndex to replace decrement to improve perfermence
 		rf.nextIndex[server] = min(reply.NextTryIndex, rf.getLastLogIndex())
 	}
 
 	baseIndex := rf.log[0].Index
 	for N := rf.getLastLogIndex(); N > rf.commitIndex && rf.log[N-baseIndex].Term == rf.currentTerm; N-- {
+		// Rules for leader: If there exists an N such that N > commitIndex, a majority ofmatchIndex[i] ≥ N, 
+		// and log[N].term == currentTerm: set commitIndex = N
 		// find if there exists an N to update commitIndex
 		count := 1
 		for i := range rf.peers {
@@ -524,6 +548,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 
 	if args.Term > rf.currentTerm {
+		// Rules for all server: If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
 		// become follower and update current term
 		rf.state = STATE_FOLLOWER
 		rf.currentTerm = args.Term
@@ -575,6 +600,7 @@ func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply
 	}
 
 	if reply.Term > rf.currentTerm {
+		// Rules for all server: If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
 		// become follower and update current term
 		rf.currentTerm = reply.Term
 		rf.state = STATE_FOLLOWER
@@ -603,6 +629,7 @@ func (rf *Raft) broadcastHeartbeat() {
 	for server := range rf.peers {
 		if server != rf.me && rf.state == STATE_LEADER {
 			if rf.nextIndex[server] > baseIndex {
+				// target server's log index is bigger than leader's minimum log index , move on
 				args := &AppendEntriesArgs{}
 				args.Term = rf.currentTerm
 				args.LeaderId = rf.me
@@ -610,6 +637,8 @@ func (rf *Raft) broadcastHeartbeat() {
 				if args.PrevLogIndex >= baseIndex {
 					args.PrevLogTerm = rf.log[args.PrevLogIndex-baseIndex].Term
 				}
+				// Rules for leader: If last log index ≥ nextIndex for a follower: send
+				// AppendEntries RPC with log entries starting at nextIndex 
 				if rf.nextIndex[server] <= rf.getLastLogIndex() {
 					args.Entries = rf.log[rf.nextIndex[server]-baseIndex:]
 				}
@@ -617,6 +646,8 @@ func (rf *Raft) broadcastHeartbeat() {
 
 				go rf.sendAppendEntries(server, args, &AppendEntriesReply{})
 			} else {
+				// target server's log index is smaller than leader's minimum log index
+				// need to catch up leader using snapshot
 				args := &InstallSnapshotArgs{}
 				args.Term = rf.currentTerm
 				args.LeaderId = rf.me
@@ -677,14 +708,23 @@ func (rf *Raft) Run() {
 			select {
 			case <-rf.chanGrantVote:
 			case <-rf.chanHeartbeat:
+			// Rules for follower: If election timeout elapses without receiving AppendEntries RPC from current leader 
+			// or granting vote to candidate: convert to candidate
 			case <-time.After(time.Millisecond * time.Duration(rand.Intn(300)+200)):
 				rf.state = STATE_CANDIDATE
 				rf.persist()
 			}
 		case STATE_LEADER:
+			// Rules for leader: Upon election: send initial empty AppendEntries RPCs (heartbeat) to each server;
+			// repeat during idle periods to prevent election timeouts 
 			go rf.broadcastHeartbeat()
 			time.Sleep(time.Millisecond * 60)
 		case STATE_CANDIDATE:
+			// Rules for candidate: On conversion to candidate, start election: 
+			//• Increment currentTerm 
+			//• Vote for self 
+			//• Reset election timer 
+			//• Send RequestVote RPCs to all other servers
 			rf.mu.Lock()
 			rf.currentTerm++
 			rf.votedFor = rf.me
@@ -694,6 +734,7 @@ func (rf *Raft) Run() {
 			go rf.broadcastRequestVote()
 
 			select {
+			//Rules for candidate: If AppendEntries RPC received from new leader: convert to follower
 			case <-rf.chanHeartbeat:
 				rf.state = STATE_FOLLOWER
 			case <-rf.chanWinElect:
